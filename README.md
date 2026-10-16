@@ -1,5 +1,8 @@
 # iroh-bridge
 
+[![npm](https://img.shields.io/npm/v/iroh-fetch)](https://www.npmjs.com/package/iroh-fetch)
+[![ci](https://github.com/poommin2543/iroh-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/poommin2543/iroh-bridge/actions/workflows/ci.yml)
+
 Let a frontend (Next.js on Vercel or any other host) and Node.js reach an HTTP backend that sits behind NAT —
 no open ports, no public IP and no tunnel service like ngrok. Everything runs on [iroh](https://www.iroh.computer/).
 
@@ -135,11 +138,12 @@ cd packages/iroh-fetch && IROH_ENDPOINT_ID=<id> npm test
 ## Releasing to npm
 
 The [`publish-npm`](.github/workflows/publish-npm.yml) workflow builds the WASM and publishes `packages/iroh-fetch`
-when you push a tag like `v0.1.0`. It needs an `NPM_TOKEN` repository secret (an npm *automation* or granular access token
-with publish rights).
+when you push a tag matching the package version (e.g. `v0.1.0`). It uses npm
+[trusted publishing](https://docs.npmjs.com/trusted-publishers), so no npm token is stored in the repository; the package's
+npm settings trust `poommin2543/iroh-bridge` / `publish-npm.yml`.
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.1.1 && git push origin v0.1.1
 ```
 
 ## Production notes

@@ -17,5 +17,17 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y clang
       - name: Build gateway
         run: cargo build --locked -p iroh-gateway
+      - name: Install wasm-bindgen and binaryen
+        run: |
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/version = "\(.*\)"/\1/p')
+          cargo install wasm-bindgen-cli --version "$version" --locked
+          curl -sL https://github.com/WebAssembly/binaryen/releases/download/version_125/binaryen-version_125-x86_64-linux.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-version_125/bin" >> "$GITHUB_PATH"
       - name: Build web client
-        run: cargo build --locked -p web-client --target wasm32-unknown-unknown
+        run: ./scripts/build-wasm.sh
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Load test
+        working-directory: packages/iroh-fetch
+        run: npm test

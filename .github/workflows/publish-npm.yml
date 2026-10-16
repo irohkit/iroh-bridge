@@ -29,7 +29,11 @@ jobs:
 
       - name: Install build tools
         run: |
-          sudo apt-get update && sudo apt-get install -y clang binaryen
+          sudo apt-get update && sudo apt-get install -y clang
+          # Ubuntu's packaged binaryen is too old: its wasm-opt exports the wrong table and the
+          # module fails to load. Use a pinned upstream release instead.
+          curl -sL https://github.com/WebAssembly/binaryen/releases/download/version_125/binaryen-version_125-x86_64-linux.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-version_125/bin" >> "$GITHUB_PATH"
           version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/version = "\(.*\)"/\1/p')
           cargo install wasm-bindgen-cli --version "$version" --locked
 
@@ -43,6 +47,10 @@ jobs:
 
       # Trusted publishing (OIDC) needs npm >= 11.5.1; no NPM_TOKEN secret is used.
       - run: npm install -g npm@latest
+
+      - name: Smoke-test the built package
+        working-directory: packages/iroh-fetch
+        run: npm test
 
       - name: Publish
         working-directory: packages/iroh-fetch

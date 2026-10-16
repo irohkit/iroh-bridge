@@ -1,0 +1,22 @@
+{
+  "name": "iroh-fetch",
+  "version": "0.1.0",
+  "description": "fetch() over iroh: reach an HTTP backend behind any NAT from browsers and Node.js",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "engines": { "node": ">=22" },
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "node": "./src/node.js",
+      "default": "./src/browser.js"
+    }
+  },
+  "files": ["src", "wasm/web_client.js", "wasm/web_client.d.ts", "wasm/web_client_bg.wasm", "wasm/web_client_bg.wasm.d.ts"],
+  "scripts": {
+    "build": "../../scripts/build-wasm.sh",
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": ["iroh", "p2p", "nat", "fetch", "wasm"]
+}

@@ -1,0 +1,17 @@
+[package]
+name = "iroh-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+proto = { path = "../proto" }
+iroh = { workspace = true, default-features = true }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }

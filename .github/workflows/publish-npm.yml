@@ -43,7 +43,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+          # No registry-url: it writes an .npmrc with a placeholder token that npm would use
+          # instead of the trusted-publishing (OIDC) exchange.
 
       # Trusted publishing (OIDC) needs npm >= 11.5.1; no NPM_TOKEN secret is used.
       - run: npm install -g npm@latest

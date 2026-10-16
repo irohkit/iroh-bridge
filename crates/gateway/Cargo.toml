@@ -3,7 +3,7 @@ name = "iroh-gateway"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/poommin2543/iroh-bridge"
+repository = "https://github.com/irohkit/iroh-bridge"
 
 [dependencies]
 proto = { path = "../proto" }

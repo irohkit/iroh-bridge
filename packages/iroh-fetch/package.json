@@ -6,12 +6,12 @@
   "author": "poommin2543",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/poommin2543/iroh-bridge.git",
+    "url": "git+https://github.com/irohkit/iroh-bridge.git",
     "directory": "packages/iroh-fetch"
   },
-  "homepage": "https://github.com/poommin2543/iroh-bridge#readme",
+  "homepage": "https://github.com/irohkit/iroh-bridge#readme",
   "bugs": {
-    "url": "https://github.com/poommin2543/iroh-bridge/issues"
+    "url": "https://github.com/irohkit/iroh-bridge/issues"
   },
   "type": "module",
   "sideEffects": false,

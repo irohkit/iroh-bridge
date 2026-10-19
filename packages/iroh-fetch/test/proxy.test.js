@@ -42,8 +42,9 @@ test("GET is forwarded", opts, async () => {
   const body = await res.json();
   assert.equal(body.backend, "A");
   assert.equal(body.url, "/hello?x=1");
-  // The gateway can route by the host the client used.
-  assert.equal(body.headers["x-iroh-host"], new URL(base).host);
+  // The gateway can route by the host the client used, and passes it on as X-Forwarded-Host
+  // (gateways before 0.2 forwarded the raw x-iroh-host instead).
+  assert.equal(body.headers["x-forwarded-host"] ?? body.headers["x-iroh-host"], new URL(base).host);
 });
 
 test("POST body is streamed through", opts, async () => {
@@ -150,6 +151,69 @@ test("WebSocket: fragmented message, ping and client close on a raw socket", opt
   const reply = await frames.next();
   assert.equal(reply.opcode, 0x8);
   assert.equal(reply.payload.readUInt16BE(0), 1000);
+  await once(sock, "close");
+});
+
+test("only serves the local user: no rebinding hosts, foreign origins or forward-proxy requests", opts, async () => {
+  const { hostname, port } = new URL(base);
+  const raw = async (request) => {
+    const sock = net.connect(Number(port), hostname);
+    await once(sock, "connect");
+    // Not end(): the proxy treats a half-closed socket as a client that went away.
+    sock.write(request.replace("\r\n", "\r\nConnection: close\r\n"));
+    let out = "";
+    for await (const d of sock) out += d;
+    return out.split("\r\n")[0];
+  };
+  // A hostname a website could point at 127.0.0.1 (DNS rebinding).
+  assert.match(await raw("GET /hello HTTP/1.1\r\nHost: attacker.example:8080\r\n\r\n"), /^HTTP\/1\.1 403/);
+  assert.match(await raw("GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n"), /^HTTP\/1\.1 200/);
+  assert.match(await raw("GET /hello HTTP/1.1\r\nHost: app.localhost\r\n\r\n"), /^HTTP\/1\.1 200/);
+  // Another site's page calling the proxy (CSRF), versus a local dev server.
+  assert.match(await raw("POST /items HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\n\r\n"), /^HTTP\/1\.1 403/);
+  assert.match(await raw("GET /hello HTTP/1.1\r\nHost: localhost\r\nOrigin: null\r\n\r\n"), /^HTTP\/1\.1 403/);
+  assert.match(await raw("GET /hello HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost:3000\r\n\r\n"), /^HTTP\/1\.1 200/);
+  // Not a forward proxy.
+  assert.match(await raw("GET http://evil.example/x HTTP/1.1\r\nHost: evil.example\r\n\r\n"), /^HTTP\/1\.1 40[03]/);
+  assert.match(await raw("GET http://evil.example/x HTTP/1.1\r\nHost: localhost\r\n\r\n"), /^HTTP\/1\.1 400/);
+  assert.equal(await raw("CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n\r\n"), "");
+  // Oversized headers are refused by Node's parser before anything is forwarded.
+  assert.match(await raw(`GET /hello HTTP/1.1\r\nHost: localhost\r\nX-Big: ${"a".repeat(64 * 1024)}\r\n\r\n`), /^HTTP\/1\.1 431/);
+});
+
+test("WebSocket from a foreign origin is refused (cross-site WebSocket hijacking)", opts, async () => {
+  const { hostname, port } = new URL(base);
+  const sock = net.connect(Number(port), hostname);
+  await once(sock, "connect");
+  sock.write(
+    "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+  );
+  let out = "";
+  for await (const d of sock) out += d;
+  assert.match(out, /^HTTP\/1\.1 403/);
+});
+
+test("WebSocket: a message over the size limit closes with 1009", opts, async () => {
+  const { hostname, port } = new URL(base);
+  const sock = net.connect(Number(port), hostname);
+  await once(sock, "connect");
+  sock.write(
+    "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+  );
+  const frames = readFrames(sock);
+  assert.match(await frames.handshake, /^HTTP\/1\.1 101/);
+  await frames.next(); // the backend's hello
+  // Only the header of a 65 MB frame: refused before any payload is buffered.
+  const header = Buffer.alloc(14);
+  header[0] = 0x82;
+  header[1] = 0x80 | 127;
+  header.writeBigUInt64BE(65n * 1024n * 1024n, 2);
+  sock.write(header);
+  const close = await frames.next();
+  assert.equal(close.opcode, 0x8);
+  assert.equal(close.payload.readUInt16BE(0), 1009);
   await once(sock, "close");
 });
 

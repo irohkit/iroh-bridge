@@ -3,6 +3,7 @@
 // so curl, Postman, browsers and any other HTTP or WebSocket client work unchanged.
 import http from "node:http";
 import { createHash } from "node:crypto";
+import net from "node:net";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { parseArgs } from "node:util";
@@ -16,7 +17,16 @@ Several comma-separated endpoint ids are replicas of one backend (failover).
 
 Options:
   --port <n>              Local port to listen on (default 8080, 0 = any free port)
-  --host <addr>           Local address to bind (default 127.0.0.1)
+  --host <addr>           Local address to bind (default 127.0.0.1). Anything else
+                          lets other machines use your gateway access, so it warns.
+  --allow-host <names>    Extra Host names to accept, comma-separated ("*" = any).
+                          IP addresses, localhost and *.localhost always work; other
+                          names are refused so a website can't reach the proxy through
+                          DNS rebinding.
+  --allow-origin <list>   Extra browser origins that may call the proxy, comma-separated
+                          ("*" = any). By default only pages served from the proxy itself
+                          or from localhost may, so other sites can't use your gateway
+                          access (cross-site requests and WebSockets).
   --relay-url <url>       Relay URL, only needed when the gateway uses a custom relay
   --connect-timeout <ms>  How long to wait for the gateway (default 15000, 0 = forever)
   -h, --help              Show this help
@@ -75,6 +85,10 @@ async function main() {
   const port = toNumber(values.port, "--port");
   if (!Number.isInteger(port) || port < 0 || port > 65535) fail(`invalid --port ${values.port}`);
   const connectTimeout = toNumber(values["connect-timeout"], "--connect-timeout");
+  const policy = {
+    hosts: new Set(list(values["allow-host"]).map((h) => h.toLowerCase())),
+    origins: new Set(list(values["allow-origin"]).map((o) => (o === "*" || o === "null" ? o : originOf(o)))),
+  };
 
   let iroh;
   try {
@@ -85,10 +99,32 @@ async function main() {
   }
 
   const sockets = new Set();
-  const server = http.createServer((req, res) => proxyRequest(iroh, req, res));
-  server.on("upgrade", (req, socket, head) => proxyUpgrade(iroh, req, socket, head, sockets));
+  const server = http.createServer((req, res) => {
+    const refused = refusal(req, policy);
+    if (refused) return res.writeHead(refused[0], { "content-type": "text/plain; charset=utf-8", connection: "close" }).end(`iroh-proxy: ${refused[1]}\n`);
+    // A rejection here would otherwise end the process (Node's default for unhandled ones).
+    proxyRequest(iroh, req, res).catch((err) => {
+      console.error(`iroh-proxy: ${req.method} ${req.url}: ${err?.message ?? err}`);
+      res.destroy();
+    });
+  });
+  server.on("upgrade", (req, socket, head) => {
+    const refused = refusal(req, policy);
+    if (refused) return rejectUpgrade(socket, refused[0], refused[0] === 403 ? "Forbidden" : "Bad Request", `iroh-proxy: ${refused[1]}\n`);
+    try {
+      proxyUpgrade(iroh, req, socket, head, sockets);
+    } catch (err) {
+      console.error(`iroh-proxy: WebSocket ${req.url}: ${err?.message ?? err}`);
+      socket.destroy();
+    }
+  });
+  // CONNECT (forward-proxy tunnels) is not supported: without a "connect" listener Node closes
+  // those connections, which is what we want, so none is added.
   server.on("clientError", (err, socket) => {
-    if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    // Node's parser already caps the head at 16 KB (--max-http-header-size) and rejects malformed
+    // requests; nothing of such a request is forwarded.
+    const status = err.code === "HPE_HEADER_OVERFLOW" ? "431 Request Header Fields Too Large" : "400 Bad Request";
+    if (socket.writable) socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
     else socket.destroy();
   });
 
@@ -106,6 +142,12 @@ async function main() {
   const shown = address.includes(":") ? `[${address}]` : address;
   const replicas = endpointIds.length > 1 ? ` (${endpointIds.length} replicas)` : "";
   console.log(`iroh-proxy: http://${shown}:${actual} -> gateway ${endpointIds[0].slice(0, 8)}…${replicas}`);
+  if (!isLoopback(address)) {
+    console.error(
+      `iroh-proxy: WARNING: listening on ${shown}, not a loopback address. Anyone who can reach this ` +
+        "port uses the gateway as this machine (same iroh identity, same access). Bind 127.0.0.1 unless you mean it.",
+    );
+  }
 
   let stopping = false;
   const shutdown = async () => {
@@ -129,6 +171,8 @@ function parseCli() {
       options: {
         port: { type: "string", default: "8080" },
         host: { type: "string", default: "127.0.0.1" },
+        "allow-host": { type: "string", default: "" },
+        "allow-origin": { type: "string", default: "" },
         "relay-url": { type: "string" },
         "connect-timeout": { type: "string", default: "15000" },
         help: { type: "boolean", short: "h" },
@@ -144,6 +188,69 @@ function toNumber(value, flag) {
   const n = Number(value);
   if (value === "" || !Number.isFinite(n) || n < 0) fail(`invalid ${flag} ${value}`);
   return n;
+}
+
+function list(value) {
+  return String(value ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function originOf(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    fail(`invalid origin ${value} (expected e.g. http://localhost:3000)`);
+  }
+}
+
+/** The host part of a Host header or URL host, without port or IPv6 brackets, lowercased. */
+function hostname(host) {
+  const h = String(host).toLowerCase();
+  if (h.startsWith("[")) return h.slice(1, h.indexOf("]") >>> 0);
+  const colon = h.lastIndexOf(":");
+  return colon === -1 ? h : h.slice(0, colon);
+}
+
+function isLoopback(name) {
+  const h = hostname(name.includes(":") && !name.startsWith("[") && net.isIPv6(name) ? `[${name}]` : name);
+  return h === "localhost" || h.endsWith(".localhost") || h === "::1" || (net.isIPv4(h) && h.startsWith("127."));
+}
+
+/**
+ * Why a request must not be proxied, as [status, message], or null. The proxy acts with this
+ * machine's iroh identity, so it only serves the local user: no forward-proxy requests for other
+ * hosts, no Host names a website could point at 127.0.0.1 (DNS rebinding), and no browser
+ * requests from other sites (CSRF, cross-site WebSocket hijacking).
+ */
+function refusal(req, policy) {
+  const host = req.headers.host;
+  const target = req.url ?? "/";
+  if (!target.startsWith("/")) {
+    let url;
+    try {
+      url = new URL(target);
+    } catch {
+      return [400, "invalid request target"];
+    }
+    if (url.host !== host) return [400, "not a forward proxy: only requests for this proxy's own host are served"];
+  }
+  if (host !== undefined && !policy.hosts.has("*")) {
+    const name = hostname(host);
+    const ok = net.isIP(name) !== 0 || isLoopback(host) || policy.hosts.has(name) || policy.hosts.has(String(host).toLowerCase());
+    if (!ok) return [403, `Host ${JSON.stringify(host)} is not allowed (add it with --allow-host)`];
+  }
+  const origin = req.headers.origin;
+  if (origin !== undefined && !policy.origins.has("*") && !policy.origins.has(origin)) {
+    let url = null;
+    try {
+      url = new URL(origin);
+    } catch {}
+    const ok = url && (url.host === host || isLoopback(url.host) || policy.origins.has(url.origin));
+    if (!ok) return [403, `requests from ${JSON.stringify(origin)} are not allowed (add it with --allow-origin)`];
+  }
+  return null;
 }
 
 function fail(message) {
@@ -171,7 +278,7 @@ function forwardHeaders(req, skip) {
   return out;
 }
 
-/** Path and query of the request; absolute-form targets (forward-proxy style) are reduced to that. */
+/** Path and query of the request; absolute-form targets (already checked to name this proxy) are reduced to that. */
 function targetPath(req) {
   const url = req.url ?? "/";
   if (url.startsWith("/")) return url;
@@ -297,6 +404,10 @@ class WebSocketLink {
   #socket;
   #remote;
   #buf = Buffer.alloc(0);
+  // Chunks not yet joined into #buf, and how many bytes the next frame needs at least.
+  #pending = [];
+  #pendingLen = 0;
+  #need = 2;
   #fragments = null; // { text, parts, size } while a fragmented message is arriving
   #closeSent = false;
   #closeReceived = false;
@@ -318,7 +429,14 @@ class WebSocketLink {
 
   /** Feeds bytes from the client and handles every complete frame in them. */
   receive(chunk) {
-    this.#buf = this.#buf.length ? Buffer.concat([this.#buf, chunk]) : chunk;
+    this.#pending.push(chunk);
+    this.#pendingLen += chunk.length;
+    // Join only once the next frame can be complete, so a large frame arriving in many small
+    // chunks is copied once instead of once per chunk.
+    if (this.#buf.length + this.#pendingLen < this.#need) return;
+    this.#buf = this.#buf.length || this.#pending.length > 1 ? Buffer.concat([this.#buf, ...this.#pending]) : this.#pending[0];
+    this.#pending = [];
+    this.#pendingLen = 0;
     for (;;) {
       const frame = this.#parseFrame();
       if (!frame) return;
@@ -330,6 +448,7 @@ class WebSocketLink {
   /** Removes one frame from the buffer, or returns null when it is not complete yet. */
   #parseFrame() {
     const b = this.#buf;
+    this.#need = 2;
     if (b.length < 2) return null;
     const fin = (b[0] & 0x80) !== 0;
     const rsv = b[0] & 0x70;
@@ -338,11 +457,11 @@ class WebSocketLink {
     let len = b[1] & 0x7f;
     let offset = 2;
     if (len === 126) {
-      if (b.length < 4) return null;
+      if (b.length < (this.#need = 4)) return null;
       len = b.readUInt16BE(2);
       offset = 4;
     } else if (len === 127) {
-      if (b.length < 10) return null;
+      if (b.length < (this.#need = 10)) return null;
       const big = b.readBigUInt64BE(2);
       if (big > BigInt(MAX_MESSAGE)) return this.#protocolError(1009, "message too big");
       len = Number(big);
@@ -352,11 +471,12 @@ class WebSocketLink {
     if (rsv) return this.#protocolError(1002, "reserved bits set");
     if (!masked) return this.#protocolError(1002, "client frames must be masked");
     if (len > MAX_MESSAGE) return this.#protocolError(1009, "message too big");
-    if (b.length < offset + 4 + len) return null;
+    if (b.length < (this.#need = offset + 4 + len)) return null;
     const mask = b.subarray(offset, offset + 4);
     const payload = Buffer.from(b.subarray(offset + 4, offset + 4 + len));
     for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
     this.#buf = b.subarray(offset + 4 + len);
+    this.#need = 2;
     return { fin, opcode, payload };
   }
 
@@ -458,6 +578,8 @@ class WebSocketLink {
 
   #protocolError(code, reason) {
     this.#buf = Buffer.alloc(0);
+    this.#pending = [];
+    this.#pendingLen = 0;
     if (!this.#socket.destroyed) {
       this.#sendClose(code, reason);
       this.#socket.end();

@@ -28,16 +28,21 @@ Browser / Node.js                     iroh relay                    backend mach
 
 ### 1. Backend side: run the gateway
 
+Download a prebuilt binary for Linux (x86_64, arm64) or macOS (Apple silicon) from the
+[releases page](https://github.com/irohkit/iroh-bridge/releases), or build it:
+
 ```bash
 cargo build --release -p iroh-gateway
 ```
+
+Try it in the foreground:
 
 ```bash
 BACKEND_URL=http://127.0.0.1:8080 ./target/release/iroh-gateway
 ```
 
 On startup it prints `IROH_ENDPOINT_ID=...`, which is your backend's "address". It stays the same as long as you keep
-`iroh-gateway.key`. Keep that file secret: anyone who has it can impersonate your backend.
+the key file (`iroh-gateway.key` by default). Keep that file secret: anyone who has it can impersonate your backend.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -46,15 +51,15 @@ On startup it prints `IROH_ENDPOINT_ID=...`, which is your backend's "address". 
 | `IROH_RELAY_URL` | (n0 relays) | Use your own relay server |
 | `MAX_BODY_BYTES` | 32 MiB | Maximum request body size |
 
-Example systemd unit to keep it running:
+**Run it as a service** so it survives reboots. On a systemd machine:
 
-```ini
-[Service]
-Environment=BACKEND_URL=http://127.0.0.1:8080
-Environment=IROH_KEY_FILE=/var/lib/iroh-gateway/key
-ExecStart=/usr/local/bin/iroh-gateway
-Restart=always
+```bash
+sudo ./deploy/install.sh http://127.0.0.1:8080
 ```
+
+This installs the binary to `/usr/local/bin`, creates an `iroh-gateway` system user, keeps the key in
+`/var/lib/iroh-gateway/key`, enables [`deploy/iroh-gateway.service`](deploy/iroh-gateway.service) and prints the endpoint id.
+Later you can read it again with `journalctl -u iroh-gateway | grep IROH_ENDPOINT_ID`.
 
 ### 2. Frontend side: use `iroh-fetch`
 
@@ -153,7 +158,8 @@ cd packages/iroh-fetch && IROH_ENDPOINT_ID=<id> npm test
 
 ## Releasing to npm
 
-The [`publish-npm`](.github/workflows/publish-npm.yml) workflow builds the WASM and publishes `packages/iroh-fetch`
+Tags also trigger [`release-gateway`](.github/workflows/release-gateway.yml), which attaches gateway binaries to the
+GitHub release. The [`publish-npm`](.github/workflows/publish-npm.yml) workflow builds the WASM and publishes `packages/iroh-fetch`
 when you push a tag matching the package version (e.g. `v0.1.0`). It uses npm
 [trusted publishing](https://docs.npmjs.com/trusted-publishers), so no npm token is stored in the repository; the package's
 npm settings trust `irohkit/iroh-bridge` / `publish-npm.yml`.

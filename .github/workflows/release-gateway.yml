@@ -1,0 +1,67 @@
+name: release-gateway
+
+# Attaches prebuilt iroh-gateway binaries to the GitHub release for each tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach binaries to (e.g. v0.1.3)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on 22.04 so the binaries run on distros with glibc >= 2.35.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p iroh-gateway
+      - name: Package
+        run: |
+          name="iroh-gateway-$TAG-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/iroh-gateway LICENSE "$name/"
+          if [ -f deploy/iroh-gateway.service ]; then cp deploy/iroh-gateway.service "$name/"; fi
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: iroh-gateway-*.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create or update the release
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" \
+                 --notes "iroh-fetch on npm: https://www.npmjs.com/package/iroh-fetch/v/${TAG#v}"
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber iroh-gateway-*.tar.gz*

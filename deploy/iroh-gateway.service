@@ -1,0 +1,23 @@
+# systemd unit for iroh-gateway. Installed by deploy/install.sh, or copy it to
+# /etc/systemd/system/ and adjust User, BACKEND_URL and the paths.
+[Unit]
+Description=iroh-gateway: expose a local HTTP backend over iroh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=iroh-gateway
+Environment=BACKEND_URL=http://127.0.0.1:8080
+Environment=IROH_KEY_FILE=/var/lib/iroh-gateway/key
+Environment=RUST_LOG=iroh_gateway=info
+ExecStart=/usr/local/bin/iroh-gateway
+Restart=always
+RestartSec=2
+StateDirectory=iroh-gateway
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -73,8 +73,6 @@ USER iroh:iroh
 # The gateway only makes outbound connections (UDP for iroh, HTTPS for the
 # relays, HTTP to the backend), so no ports are exposed.
 
-# The gateway shuts down cleanly on Ctrl-C (SIGINT); it has no SIGTERM handler,
-# so make `docker stop` send SIGINT instead of waiting for the kill timeout.
-STOPSIGNAL SIGINT
+# The gateway shuts down cleanly on SIGTERM, which `docker stop` sends.
 
 ENTRYPOINT ["/usr/local/bin/iroh-gateway"]

@@ -3,65 +3,77 @@
 [![npm](https://img.shields.io/npm/v/iroh-fetch)](https://www.npmjs.com/package/iroh-fetch)
 [![ci](https://github.com/irohkit/iroh-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/irohkit/iroh-bridge/actions/workflows/ci.yml)
 
-Let a frontend (Next.js on Vercel or any other host) and Node.js reach an HTTP backend that sits behind NAT —
-no open ports, no public IP and no tunnel service like ngrok. Everything runs on [iroh](https://www.iroh.computer/).
+Use backends that sit behind NAT as if they had a public URL. Your frontend (Next.js on Vercel, any static host, or
+Node.js) keeps calling `fetch("https://api.example.com/...")`, `new EventSource(...)` and `new WebSocket(...)`;
+the traffic goes over [iroh](https://www.iroh.computer/) to a small gateway next to your backend. There's no open
+port, no public IP, no DNS, no TLS certificate and no tunnel service to run.
 
 ```
-Browser / Node.js                     iroh relay                    backend machine (behind NAT)
-┌──────────────────┐   WebSocket   ┌──────────────┐   QUIC/UDP   ┌───────────────┐  HTTP  ┌─────────┐
-│ iroh-fetch (WASM)│ ────────────▶ │  n0 or yours │ ◀─────────── │ iroh-gateway  │ ─────▶ │ backend │
-└──────────────────┘               └──────────────┘  (outbound)  └───────────────┘        └─────────┘
+Browser / Node.js                      iroh relay                    backend machine (behind NAT)
+┌───────────────────┐   WebSocket   ┌──────────────┐   QUIC/UDP   ┌───────────────┐  HTTP  ┌──────────┐
+│ iroh-fetch (WASM) │ ────────────▶ │  n0 or yours │ ◀─────────── │ iroh-gateway  │ ─────▶ │ backends │
+└───────────────────┘               └──────────────┘  (outbound)  └───────────────┘        └──────────┘
 ```
 
-- **`crates/gateway`** (`iroh-gateway`): a Rust program that runs next to your existing backend, accepts requests over iroh
-  and forwards them to `BACKEND_URL`. All of its connections are outbound, so it works behind any NAT, CGNAT or firewall.
-- **`packages/iroh-fetch`**: an npm package (Rust → WASM) that gives you a standard-looking `fetch()` and `WebSocket`,
-  in browsers and in Node.js ≥ 22.
-- **`crates/proto`**: the shared wire format. One request (or one WebSocket) per QUIC stream; many run concurrently on one connection.
-- **`examples/nextjs`**: an example app (provider + `useIroh()` hook) with HTTP, SSE and WebSocket demos.
-- **`examples/backend`**: a mock backend to try things with (JSON echo, `/stream`, `/sse`, `/upload`, `/slow`, WebSocket echo on `/ws`).
+**Live demo:** <https://iroh-bridge.vercel.app>: press **Run self-test**. The page talks to two backends behind NAT, one
+of them through two HA gateways, using only the standard `fetch` / `EventSource` / `WebSocket`.
 
-> Browsers can't send UDP, so the client side always goes through a relay. Traffic is end-to-end encrypted; the relay
-> can't read it. Through n0's public relays we measured roughly 70–120 ms per request once connected.
+## Contents
 
-## Getting started
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Frontend: `iroh-fetch`](#frontend-iroh-fetch)
+  - [Use the normal fetch, EventSource and WebSocket (`install`)](#use-the-normal-fetch-eventsource-and-websocket-install)
+  - [React / Next.js](#react--nextjs)
+  - [Several backends](#several-backends)
+  - [High availability](#high-availability)
+  - [fetch behaviour](#fetch-behaviour)
+  - [Streaming, uploads, timeouts](#streaming-uploads-timeouts)
+  - [WebSocket and EventSource](#websocket-and-eventsource)
+  - [Authentication (JWT, sessions)](#authentication-jwt-sessions)
+  - [Node.js](#nodejs)
+  - [Options reference](#options-reference)
+- [Backend: `iroh-gateway`](#backend-iroh-gateway)
+  - [Install](#install)
+  - [Configuration](#configuration)
+  - [Several upstreams, routing by host and path](#several-upstreams-routing-by-host-and-path)
+  - [Access control](#access-control)
+  - [What your backend sees](#what-your-backend-sees)
+- [Local port: `iroh-proxy`](#local-port-iroh-proxy)
+- [Production notes](#production-notes)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
 
-### 1. Backend side: run the gateway
+## Features
 
-Download a prebuilt binary for Linux (x86_64, arm64) or macOS (Apple silicon) from the
-[releases page](https://github.com/irohkit/iroh-bridge/releases), or build it:
+| | |
+|---|---|
+| **Works like a public URL** | `install()` routes the global `fetch`, `EventSource` and `WebSocket` for chosen origins, so existing code, SWR, React Query, axios (fetch adapter) and friends work unchanged |
+| **Full fetch semantics** | absolute or relative URLs, all methods and headers, `res.url` / `res.redirected`, redirects (`follow` / `manual` / `error`), cookies (`credentials`), `AbortSignal` (incl. `AbortSignal.timeout`) |
+| **Streaming both ways** | responses stream (SSE, NDJSON, downloads); uploads of `File`, `Blob`, `FormData` or `ReadableStream` stream without buffering |
+| **WebSocket** | standard API, text and binary, subprotocols, clean close codes, plus custom handshake headers (e.g. `Authorization`) |
+| **EventSource** | standard API with named events, automatic reconnect and `Last-Event-ID` |
+| **Auth as usual** | JWT / bearer tokens on fetch, WebSocket and EventSource; cookie sessions with a cookie jar per backend |
+| **Many backends** | one frontend, any number of backends, routed by origin over one shared connection |
+| **High availability** | several gateways per backend with `failover` or `round-robin`; several upstreams per gateway with health checks |
+| **Gateway routing** | one gateway can serve many internal services by host and path prefix |
+| **Access control** | allow-list client endpoint ids and paths at the gateway |
+| **Hardened** | strict path and header validation, limits and timeouts against slow or flooding clients, no error leaks, sandboxed service; checked by attacking test gateways |
+| **Trustworthy caller identity** | the backend gets `X-Iroh-Remote-Id`, the caller's cryptographically verified endpoint id |
+| **React bindings** | `iroh-fetch/react`: `<IrohProvider>`, `useIroh()`, `useIrohFetch()` |
+| **Runs anywhere** | browsers and Node.js ≥ 22; gateway binaries for Linux x86_64/arm64 and macOS, a Docker image, and a systemd unit |
+| **Local port** | `iroh-proxy` exposes a gateway as `http://127.0.0.1:PORT` for curl, Postman or any HTTP client |
+
+## Quick start
+
+**1. Next to your backend**, start a gateway (it prints the endpoint id, which is your backend's address):
 
 ```bash
-cargo build --release -p iroh-gateway
+BACKEND_URL=http://127.0.0.1:8080 ./iroh-gateway
+# IROH_ENDPOINT_ID=acc0c8d6bc20700875b5fe1da1a3379f77f28dd16f8a66e3368856473ecc7a53
 ```
 
-Try it in the foreground:
-
-```bash
-BACKEND_URL=http://127.0.0.1:8080 ./target/release/iroh-gateway
-```
-
-On startup it prints `IROH_ENDPOINT_ID=...`, which is your backend's "address". It stays the same as long as you keep
-the key file (`iroh-gateway.key` by default). Keep that file secret: anyone who has it can impersonate your backend.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `BACKEND_URL` | `http://127.0.0.1:8080` | HTTP backend that requests are forwarded to |
-| `IROH_KEY_FILE` | `iroh-gateway.key` | The endpoint's secret key file |
-| `IROH_RELAY_URL` | (n0 relays) | Use your own relay server |
-| `MAX_BODY_BYTES` | 32 MiB | Maximum request body size |
-
-**Run it as a service** so it survives reboots. On a systemd machine:
-
-```bash
-sudo ./deploy/install.sh http://127.0.0.1:8080
-```
-
-This installs the binary to `/usr/local/bin`, creates an `iroh-gateway` system user, keeps the key in
-`/var/lib/iroh-gateway/key`, enables [`deploy/iroh-gateway.service`](deploy/iroh-gateway.service) and prints the endpoint id.
-Later you can read it again with `journalctl -u iroh-gateway | grep IROH_ENDPOINT_ID`.
-
-### 2. Frontend side: use `iroh-fetch`
+**2. In the frontend**, map an origin of your choice to that id and keep writing normal code:
 
 ```bash
 npm install iroh-fetch
@@ -70,122 +82,367 @@ npm install iroh-fetch
 ```ts
 import { createIrohFetch } from "iroh-fetch";
 
-const iroh = await createIrohFetch({ endpointId: process.env.NEXT_PUBLIC_IROH_ENDPOINT_ID! });
-const res = await iroh.fetch("/api/users?page=2"); // a standard Response
-const users = await res.json();
-await iroh.fetch("/api/users", {
+const iroh = await createIrohFetch({
+  backends: { "https://api.example.com": "acc0c8d6bc20700875b5fe1da1a3379f77f28dd16f8a66e3368856473ecc7a53" },
+});
+iroh.install(); // from now on these go over iroh:
+
+const users = await (await fetch("https://api.example.com/users")).json();
+const events = new EventSource("https://api.example.com/events");
+const socket = new WebSocket("wss://api.example.com/ws");
+```
+
+The origin (`https://api.example.com`) is only a name your code uses; it doesn't need to exist in DNS. Only the path and
+query reach the backend.
+
+## Frontend: `iroh-fetch`
+
+### Use the normal fetch, EventSource and WebSocket (`install`)
+
+```ts
+const uninstall = iroh.install();                                   // the origins from `backends`
+const uninstall = iroh.install({ origins: ["https://api.example.com"] }); // or explicit origins
+const uninstall = iroh.install({ match: (url) => url.pathname.startsWith("/api/") }); // or any rule
+```
+
+Origins must be absolute URLs (`https://...`). Requests to other origins use the real `fetch` / `WebSocket` /
+`EventSource` untouched. Pass `websocket: false` or
+`eventSource: false` to leave those globals alone. Call `uninstall()` to restore them.
+
+Without `install`, use the client directly. It has the same API:
+
+```ts
+await iroh.fetch("/users");                      // path-only URLs go to the default backend
+await iroh.fetch("https://api.example.com/users");
+new iroh.EventSource("https://api.example.com/events");
+new iroh.WebSocket("wss://api.example.com/ws", ["chat.v1"]);
+```
+
+### React / Next.js
+
+```tsx
+"use client";
+import { IrohProvider, useIroh, useIrohFetch } from "iroh-fetch/react";
+
+export function Providers({ children }) {
+  return (
+    <IrohProvider backends={{ "https://api.example.com": "<endpoint id>" }} install>
+      {children}
+    </IrohProvider>
+  );
+}
+
+function Users() {
+  const iroh = useIroh(); // { status: "connecting" | "ready" | "error", client, error }
+  const fetchIroh = useIrohFetch(); // waits for the connection, usable immediately
+  // with `install`, plain fetch("https://api.example.com/...") works too once status is "ready"
+}
+```
+
+The WASM only loads in the browser (inside an effect), so server rendering is unaffected. A full example lives in
+[`examples/nextjs`](examples/nextjs): [`iroh.config.ts`](examples/nextjs/iroh.config.ts) maps origins to gateways, and
+the page uses only the standard APIs. Endpoint ids are public addresses, so they can live in the repo. You can also
+override them with `NEXT_PUBLIC_IROH_BACKENDS` (JSON, same shape).
+
+### Several backends
+
+```ts
+const iroh = await createIrohFetch({
+  backends: {
+    "https://api.example.com": "<gateway A>",
+    "https://files.example.com": { endpointId: "<gateway B>" },
+    "https://admin.example.com": { endpointId: "<gateway C>", default: true }, // gets path-only URLs
+  },
+});
+
+await iroh.fetch("https://files.example.com/report.pdf");
+await iroh.backend("https://files.example.com").fetch("/report.pdf"); // scoped view, same thing
+iroh.backends; // [{ origin, replicas: [{ endpointId, healthy }], connected }]
+```
+
+All backends share one local iroh endpoint (one relay connection) and get one QUIC connection each. Each backend has its
+own cookie jar. A backend that is down doesn't affect the others: `createIrohFetch` only fails if none can be reached,
+and requests to the unreachable one fail (and retry later) on their own.
+
+### High availability
+
+Run several gateways for the same backend (on different machines, each with its own key) and list them all:
+
+```ts
+backends: {
+  "https://api.example.com": {
+    endpointIds: ["<gateway 1>", "<gateway 2>", "<gateway 3>"],
+    strategy: "round-robin", // or "failover" (default): use them in order
+  },
+}
+// single-backend shorthand: createIrohFetch({ endpointIds: [...], strategy })
+```
+
+- A replica that can't be reached is skipped for `failoverCooldown` ms (default 10 s), then tried again.
+- Requests without a body are retried on the next replica if one fails mid-request. Requests with a body (it streams
+  and can't be replayed) only fail over while connecting, before anything was sent.
+- WebSockets and EventSource connect to a healthy replica; EventSource reconnects to the next one if the stream drops.
+- Each response carries `X-Iroh-Gateway-Id`, so you can see which replica answered.
+
+On the backend side, one gateway can also spread load over several upstream processes; see
+[Several upstreams](#several-upstreams-routing-by-host-and-path).
+
+### fetch behaviour
+
+`iroh.fetch` (and the installed global `fetch`) follow the Fetch standard:
+
+- **URLs**: paths (`/x?y=1`), absolute `http(s)` URLs, `URL` objects or `Request`s. `res.url` is the URL you asked for
+  (after redirects), and `res.redirected` is set when a redirect was followed.
+- **Redirects**: `redirect: "follow"` (default, up to 20, 301/302 turn POST into GET and 303 always does),
+  `"manual"` (the 3xx is returned) or `"error"`. Redirects to another origin are returned as-is instead of followed.
+- **Cookies**: `Set-Cookie` from the backend is stored (Path, Max-Age and Expires are honoured) and sent back. Use
+  `credentials: "omit"` to skip, `cookies: false` to disable, or `persistCookies: true` to keep them across reloads
+  (localStorage, readable by page scripts, unlike real HttpOnly cookies). Inspect them with
+  `iroh.cookies.get(name)`, and use `iroh.cookies.clear()` to log out locally.
+- **Headers**: everything is passed through except hop-by-hop headers. Browsers can't read `Set-Cookie` from a
+  `Response`, but the cookie jar can.
+
+### Streaming, uploads, timeouts
+
+```ts
+// Streaming response (SSE, NDJSON, big downloads); aborting stops the backend transfer too.
+const res = await fetch("https://api.example.com/export", { signal: AbortSignal.timeout(60_000) });
+for await (const chunk of res.body) process(chunk);
+
+// Streaming upload: the file is never read into memory.
+await fetch("https://api.example.com/files", { method: "POST", body: input.files[0] });
+
+// Any ReadableStream works too.
+await fetch("https://api.example.com/ingest", { method: "POST", body: someReadableStream });
+```
+
+`createIrohFetch` rejects with a `TimeoutError` after `connectTimeout` (default 15 s) when a gateway is unreachable, so
+the app never hangs on "connecting".
+
+### WebSocket and EventSource
+
+Both follow the browser APIs (`readyState`, `onopen` / `onmessage` / `onerror` / `onclose`, `addEventListener`,
+`binaryType`, `protocol`, close codes and reasons). Two extensions the browser versions lack:
+
+```ts
+// Custom handshake headers.
+iroh.websocket("wss://api.example.com/ws", { protocols: ["chat.v1"], headers: { authorization: `Bearer ${token}` } });
+// EventSource with headers.
+new iroh.EventSource("https://api.example.com/events", { headers: { authorization: `Bearer ${token}` } });
+```
+
+Stored cookies are sent with WebSocket handshakes, like a browser does.
+
+### Authentication (JWT, sessions)
+
+Auth works exactly as it does against a public URL, because the backend receives the same headers:
+
+```ts
+// JWT / OAuth bearer tokens
+const { token } = await (await fetch("https://api.example.com/auth/login", {
   method: "POST",
   headers: { "content-type": "application/json" },
-  body: JSON.stringify({ name: "a" }),
-});
+  body: JSON.stringify({ username, password }),
+})).json();
+const me = await fetch("https://api.example.com/auth/me", { headers: { Authorization: `Bearer ${token}` } });
+
+// WebSocket: a header (iroh extension) or the usual ?access_token=
+iroh.websocket("wss://api.example.com/ws", { headers: { Authorization: `Bearer ${token}` } });
+new WebSocket(`wss://api.example.com/ws?access_token=${token}`);
+
+// EventSource with a header (iroh extension)
+new iroh.EventSource("https://api.example.com/events", { headers: { Authorization: `Bearer ${token}` } });
 ```
 
-**Streaming responses** (SSE, NDJSON, large files): the body arrives chunk by chunk as the backend sends it, and an
-`AbortController` cancels it (the gateway stops pulling from the backend right away).
+Cookie sessions work too (see [fetch behaviour](#fetch-behaviour)). The example backend
+([`examples/backend`](examples/backend/server.mjs)) has HS256 JWT login, protected routes, SSE and WebSocket, and
+[`test/jwt.test.js`](packages/iroh-fetch/test/jwt.test.js) checks that tampered, `alg: none` and expired tokens are
+rejected.
 
-```ts
-const ctrl = new AbortController();
-const res = await iroh.fetch("/api/events", { signal: ctrl.signal });
-const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
-for (;;) {
-  const { value, done } = await reader.read();
-  if (done) break;
-  console.log(value);
-}
-// call ctrl.abort() to stop
-```
+### Node.js
 
-**Streaming uploads**: pass a `File`, `Blob` or `ReadableStream<Uint8Array>` as the body and it is sent as it is
-read, so large files never sit in memory. The gateway streams it on to the backend (still capped by `MAX_BODY_BYTES`).
+The same package works in Node.js ≥ 22 (`import { createIrohFetch } from "iroh-fetch"` picks the Node build). In
+serverless functions, keep the client in a module-level variable so warm invocations reuse the connection (a cold start
+connects in about a second).
 
-```ts
-await iroh.fetch("/api/files", { method: "POST", body: fileInput.files[0] });
-```
+### Options reference
 
-**Timeouts and aborts**: `createIrohFetch` rejects with a `TimeoutError` if the gateway can't be reached within
-`connectTimeout` (default 15 s) instead of hanging, and a request's `signal` aborts at any point — including while waiting
-for the response — so `AbortSignal.timeout()` works:
+| Option | Default | |
+|---|---|---|
+| `endpointId` / `endpointIds` | | one backend: a gateway id, or several replicas |
+| `backends` | | `{ [origin]: id \| id[] \| { endpointId?, endpointIds?, strategy?, default? } }` |
+| `strategy` | `"failover"` | `"failover"` or `"round-robin"` over replicas |
+| `failoverCooldown` | `10000` | ms an unreachable replica is skipped |
+| `connect` | `true` | dial all gateways up front (otherwise on first use) |
+| `connectTimeout` | `15000` | ms to wait for a gateway before `TimeoutError` (`0` = forever) |
+| `cookies` | `true` | keep and send cookies |
+| `persistCookies` | `false` | `true` (localStorage) or a `Storage` |
+| `relayUrl` | n0 relays | your own relay; must match the gateways |
+| `logLevel` | off | `"info"`, `"debug"`, ... iroh logs in the console |
 
-```ts
-const res = await iroh.fetch("/api/slow", { signal: AbortSignal.timeout(5000) });
-```
+The client object: `fetch`, `EventSource`, `WebSocket`, `websocket(url, { protocols, headers })`, `install(opts)`,
+`backend(origin)`, `backends`, `cookies`, `endpointId` (this client's id, which the backend sees as `X-Iroh-Remote-Id`),
+`close()`.
 
-**WebSocket**: returns an object with the standard `WebSocket` API (`onopen`, `onmessage`, `send`, `close`, `binaryType`,
-`protocol`, `addEventListener`). The gateway opens the real WebSocket to `ws://<BACKEND_URL>/<path>`.
+## Backend: `iroh-gateway`
 
-```ts
-const ws = iroh.websocket("/ws", {
-  protocols: ["chat.v1"],
-  headers: { authorization: `Bearer ${token}` }, // something a browser's WebSocket can't do
-});
-ws.onmessage = (e) => console.log(e.data);
-ws.onopen = () => ws.send("hello");
-```
+### Install
 
-In Next.js, create the client once in the browser; see [`examples/nextjs/lib/iroh.tsx`](examples/nextjs/lib/iroh.tsx)
-(it imports the package dynamically inside `useEffect` so the WASM never loads during SSR).
+- **Binary**: download it for Linux x86_64/arm64 or macOS arm64 from the
+  [releases](https://github.com/irohkit/iroh-bridge/releases), or `cargo build --release -p iroh-gateway`.
+- **systemd** (starts on boot, its own user, key in `/var/lib/iroh-gateway`):
+  ```bash
+  sudo ./deploy/install.sh http://127.0.0.1:8080
+  ```
+- **Docker**: `ghcr.io/irohkit/iroh-gateway`; see [`deploy/docker`](deploy/docker) for `docker run` and a compose file.
+
+The gateway prints `IROH_ENDPOINT_ID=...` at startup (`journalctl -u iroh-gateway | grep IROH_ENDPOINT_ID`). The id stays
+the same as long as you keep the key file. Keep that file secret: whoever has it can impersonate your backend. It only
+needs outbound UDP/HTTPS, and no inbound port.
+
+### Configuration
+
+| Variable / flag | Default | |
+|---|---|---|
+| `BACKEND_URL` / `--backend` | `http://127.0.0.1:8080` | upstream(s), comma-separated |
+| `IROH_ROUTES` / `--route` | | host/path routing, see below |
+| `IROH_ALLOW_CLIENTS` / `--allow-client` | everyone | allowed client endpoint ids |
+| `IROH_ALLOW_PATHS` / `--allow-path` | everything | allowed path prefixes |
+| `IROH_KEY_FILE` / `--key-file` | `iroh-gateway.key` | secret key (created on first run) |
+| `IROH_RELAY_URL` / `--relay-url` | n0 relays | your own relay |
+| `MAX_BODY_BYTES` / `--max-body` | 32 MiB | request body limit |
+| `UPSTREAM_COOLDOWN_SECS` | `10` | how long an unreachable upstream is skipped |
+| `RUST_LOG` | `iroh_gateway=info` | log level |
+
+Limits and timeouts, all with flags of the same name (`--max-head`, `--head-timeout-secs`, ...). The defaults are generous
+for normal use and stop a single client from tying the gateway up:
+
+| Variable | Default | |
+|---|---|---|
+| `MAX_HEAD_BYTES` | 64 KiB | request line + headers |
+| `MAX_WS_MESSAGE_BYTES` | 16 MiB | one WebSocket message (the backend gets 1009 when exceeded) |
+| `IROH_MAX_CONNECTIONS` | 4096 | concurrent client connections |
+| `IROH_MAX_STREAMS_PER_CONNECTION` | 100 | concurrent requests per client |
+| `IROH_MAX_REQUESTS` | 8192 | concurrent requests overall (503 beyond) |
+| `HEAD_TIMEOUT_SECS` | 10 | time to send the request head (408) |
+| `BODY_IDLE_TIMEOUT_SECS` | 60 | an upload that stalls this long is dropped (408) |
+| `UPSTREAM_CONNECT_TIMEOUT_SECS` | 10 | connecting to an upstream |
+| `UPSTREAM_TIMEOUT_SECS` | 300 | waiting for the upstream's response head (504; `0` = off). Streaming responses such as SSE are never cut once they started |
+
+### Several upstreams, routing by host and path
 
 ```bash
-cd examples/nextjs && cp .env.example .env.local   # set NEXT_PUBLIC_IROH_ENDPOINT_ID
-npm install && npm run dev
+# Spread over several backend processes; ones that refuse connections are skipped for a while.
+BACKEND_URL=http://10.0.0.5:8080,http://10.0.0.6:8080 iroh-gateway
+
+# One gateway in front of several services. Most specific match wins; BACKEND_URL is the fallback.
+IROH_ROUTES='api.example.com=http://127.0.0.1:8080;files.example.com=http://10.0.0.7:9000,http://10.0.0.8:9000;/admin=http://127.0.0.1:9100' iroh-gateway
 ```
 
-### 3. Deploy to Vercel
+The host is the one your frontend used in the URL (`iroh-fetch` sends it as `x-iroh-host`), so a single gateway id can
+back several origins in `backends`. Path prefixes match whole segments and are not stripped.
 
-The app needs no server of its own, so it can be a static export or run on Vercel, Netlify or Cloudflare Pages.
-Set `NEXT_PUBLIC_IROH_ENDPOINT_ID` in the project's environment variables. To deploy the example straight from this
-repository, set the Root Directory to `examples/nextjs`; the prebuilt WASM in `packages/iroh-fetch/wasm/` is committed.
+### Access control
 
-**From Node.js (API routes / servers)**: works on Node ≥ 22, but in serverless functions every cold start has to connect
-again (~1 s). If you call it often from the server, keep the client in a module-level variable so it is reused, or run on a
-long-lived server.
+```bash
+IROH_ALLOW_CLIENTS=<endpoint id>,<endpoint id>   # refuse other clients at connection time
+IROH_ALLOW_PATHS=/api,/ws                        # everything else gets 403
+```
 
-### Troubleshooting
+Client endpoint ids are random per browser session unless you give the client a fixed key, so the client allow-list is
+mostly useful for server-to-server use (Node, `iroh-proxy`). For browser users, authenticate in your backend as you would
+on a public URL (sessions, tokens). `X-Iroh-Remote-Id` gives you a verified id to rate-limit or audit by.
 
-- **`TimeoutError: could not reach gateway`**: the gateway is offline, or the endpoint id is wrong or old. Check
-  `journalctl -u iroh-gateway` (or the gateway's output) for the current `IROH_ENDPOINT_ID`.
+### Security
+
+The gateway's endpoint id is public, so the gateway treats every client as untrusted:
+
+- Paths must be clean, printable ASCII starting with `/`. Dot segments in any encoding (`..`, `%2e%2e`, `..;`, tabs or
+  newlines inside them) are rejected, so routing and `--allow-path` can't be bypassed, and requests can't leave the
+  configured upstream.
+- Header names and values with control characters, `CONNECT` and `TRACE` are rejected. Hop-by-hop headers and every
+  header the gateway sets itself (`X-Iroh-*`, `X-Forwarded-*`, `X-Real-IP`) are stripped from clients.
+- Clients only ever see generic errors. Upstream URLs and OS errors go to the gateway log.
+- Slow or oversized requests are cut off by the limits above, so one client can't starve others.
+- The key file is created with mode `0600`, and the gateway refuses to start with a world-readable key.
+- The systemd unit runs it with no capabilities and a tight sandbox (see [`deploy/iroh-gateway.service`](deploy/iroh-gateway.service)).
+
+These were checked by attacking test gateways with a raw iroh client (smuggling, path tricks, slow-loris, floods, oversized
+WebSocket frames, error leaks).
+
+### What your backend sees
+
+A normal HTTP request: same method, path, query, headers and body, plus:
+
+- `X-Iroh-Remote-Id`: the caller's endpoint id, verified by the QUIC handshake (clients can't spoof it)
+- `X-Forwarded-Proto: https`, because the tunnel is end-to-end encrypted
+- `X-Forwarded-Host`: the host the frontend used (e.g. `api.example.com`)
+
+WebSockets are proxied to `ws://` (or `wss://`) on the same upstream.
+
+## Local port: `iroh-proxy`
+
+Expose a gateway as a local URL, like `ssh -L`, for curl, Postman, scripts, or a dev server's proxy setting:
+
+```bash
+npx -p iroh-fetch iroh-proxy <endpoint id>[,<replica id>...] --port 8080
+curl http://127.0.0.1:8080/users
+```
+
+HTTP (streaming both ways), redirects and cookies are passed through untouched, and WebSockets work too
+(`ws://127.0.0.1:8080/ws`). It listens on `127.0.0.1` only by default, and to stop other websites from using it through
+your browser (DNS rebinding, cross-site requests) it only accepts `Host: localhost`/IP and same-origin `Origin` headers.
+Add exceptions with `--allow-host` and `--allow-origin`.
+
+## Production notes
+
+- **Run your own relay**: n0's public relays are fine for development but have no SLA and may be rate limited. Run
+  [`iroh-relay`](https://docs.iroh.computer/) on a VPS with a domain and TLS, and set the same URL as `IROH_RELAY_URL` on
+  the gateways and `relayUrl` on the client, or use n0's hosted relay service.
+- **Security**: traffic is end-to-end encrypted with QUIC/TLS, and the relay can't read it. Anyone who knows an endpoint id
+  can reach that gateway, just like a public URL, so keep authenticating in your backend, and use the gateway's allow-lists
+  where they fit.
+- **Latency and throughput**: browsers can't send UDP, so the browser side always goes through a relay. Through n0's public
+  relays we measured about 70–120 ms per request and 1–3.5 MB/s for uploads. A relay close to your users does better.
+- **WASM size**: ~3.4 MB (~1.4 MB gzipped), cached after the first load. Load it lazily (the React provider does).
+
+## Troubleshooting
+
+- **`TimeoutError: could not reach gateway`**: the gateway is offline, or the endpoint id is wrong or old. Check its log for
+  the current `IROH_ENDPOINT_ID`.
+- **`no backend configured for https://...`**: the URL's origin isn't in `backends`.
 - **Node.js: `address lookup ... fetch failed` / `ETIMEDOUT`**: usually a machine whose IPv6 is configured but doesn't
   actually work, so Node's `fetch` stalls on IPv6. Run Node with `NODE_OPTIONS=--dns-result-order=ipv4first`.
 
-## Building the package
+## Development
 
-You need Rust with the `wasm32-unknown-unknown` target, `clang` (for the `ring` crate), `wasm-bindgen-cli` at the same
-version as in `Cargo.lock`, and optionally `wasm-opt`.
+```
+crates/gateway     iroh-gateway (Rust)
+crates/web-client  the iroh client compiled to WASM
+crates/proto       wire format: one request or WebSocket per QUIC stream
+packages/iroh-fetch npm package (JS API, React bindings, iroh-proxy CLI, tests)
+examples/nextjs    demo app with a self-test (deployed to Vercel)
+examples/backend   mock backend used by the demo and tests
+deploy/            systemd unit, install script, Docker
+```
+
+Build the WASM (needs Rust with `wasm32-unknown-unknown`, `clang`, `wasm-bindgen-cli` matching `Cargo.lock`, optionally
+`wasm-opt`):
 
 ```bash
 ./scripts/build-wasm.sh
 ```
 
-End-to-end tests (start `examples/backend` and the gateway first; they cover HTTP, streaming in both directions, aborts,
-timeouts and WebSocket):
+Run the end-to-end tests against running gateways in front of `examples/backend` (A on two gateways, B on one):
 
 ```bash
-cd packages/iroh-fetch && IROH_ENDPOINT_ID=<id> npm test
+cd packages/iroh-fetch
+IROH_ENDPOINT_ID=<A1> IROH_ENDPOINT_ID_A2=<A2> IROH_ENDPOINT_ID_B=<B> npm test
 ```
 
-## Releasing to npm
-
-Tags also trigger [`release-gateway`](.github/workflows/release-gateway.yml), which attaches gateway binaries to the
-GitHub release. The [`publish-npm`](.github/workflows/publish-npm.yml) workflow builds the WASM and publishes `packages/iroh-fetch`
-when you push a tag matching the package version (e.g. `v0.1.0`). It uses npm
-[trusted publishing](https://docs.npmjs.com/trusted-publishers), so no npm token is stored in the repository; the package's
-npm settings trust `irohkit/iroh-bridge` / `publish-npm.yml`.
-
-```bash
-git tag v0.1.1 && git push origin v0.1.1
-```
-
-## Production notes
-
-- **Run your own relay**: n0's public relays are fine for development but have no SLA and may be rate limited.
-  Run [`iroh-relay`](https://docs.iroh.computer/) on a VPS with a domain and TLS, then set the same URL as
-  `IROH_RELAY_URL` on the gateway and `relayUrl` on the client — or use n0's hosted relay service.
-- **Security**: anyone who knows the endpoint id can send requests to your backend (just like a public URL), so the
-  backend must do its own auth (for example with the `Authorization` header, which the gateway forwards).
-  Traffic is end-to-end encrypted with QUIC/TLS.
-- **WASM size**: ~3.4 MB (~1.4 MB gzipped). Browsers cache it after the first load; load it lazily as the example does.
-- **Throughput**: everything goes through a relay, so large transfers are bound by the relay. Through n0's public relays
-  we measured about 1.1 MB/s for a 20 MB upload; your own relay close to your users will do much better.
+**Releasing**: bump `packages/iroh-fetch/package.json`, commit, and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`).
+CI then publishes to npm (trusted publishing, no token in the repo), attaches gateway binaries to the GitHub release
+and pushes the Docker image.
 
 ## License
 

@@ -1,27 +1,29 @@
 # iroh-fetch
 
-`fetch()` over [iroh](https://www.iroh.computer/): call an HTTP backend that sits behind any NAT, from browsers and Node.js >= 22.
-The backend side runs `iroh-gateway` (see the repository root).
+Call backends behind NAT as if they had a public URL. Use the standard `fetch`, `EventSource` and `WebSocket`, and the
+traffic goes over [iroh](https://www.iroh.computer/) to an `iroh-gateway` next to your backend. It runs in browsers and
+Node.js ≥ 22.
 
 ```ts
 import { createIrohFetch } from "iroh-fetch";
 
-const iroh = await createIrohFetch({ endpointId: "<id printed by iroh-gateway>" });
-const res = await iroh.fetch("/api/users");
-console.log(await res.json());
-await iroh.close();
+const iroh = await createIrohFetch({
+  backends: {
+    "https://api.example.com": "<gateway endpoint id>",
+    "https://files.example.com": { endpointIds: ["<replica 1>", "<replica 2>"], strategy: "round-robin" },
+  },
+});
+iroh.install(); // route these origins through iroh
+
+const users = await (await fetch("https://api.example.com/users")).json();
+const events = new EventSource("https://api.example.com/events");
+const socket = new WebSocket("wss://files.example.com/ws");
 ```
 
-Bodies stream both ways: responses (SSE, NDJSON, large downloads) and uploads (`File`, `Blob`, `ReadableStream`).
-`init.signal` aborts at any point, so `AbortSignal.timeout(ms)` works, and `createIrohFetch` gives up after
-`connectTimeout` (default 15 s) with a `TimeoutError` when the gateway is unreachable.
+- Full fetch semantics: redirects, cookies, streaming in both directions, `AbortSignal`
+- Standard `WebSocket` and `EventSource` (reconnect, `Last-Event-ID`), plus custom headers
+- Many backends from one frontend, and HA replicas with failover or round-robin
+- React: `import { IrohProvider, useIroh, useIrohFetch } from "iroh-fetch/react"`
+- CLI: `npx -p iroh-fetch iroh-proxy <endpoint id> --port 8080` exposes a gateway on localhost
 
-WebSockets use the standard `WebSocket` API, plus custom handshake headers:
-
-```ts
-const ws = iroh.websocket("/ws", { protocols: ["chat.v1"], headers: { authorization: "Bearer ..." } });
-ws.onmessage = (e) => console.log(e.data);
-```
-
-Options: `endpointId` (required), `relayUrl` (when the gateway uses a custom relay), `logLevel`, `connect` (default `true`),
-`connectTimeout` (ms, default `15000`).
+Full documentation, the gateway and a live demo: <https://github.com/irohkit/iroh-bridge>

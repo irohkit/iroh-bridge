@@ -81,12 +81,11 @@ export function makeCreate(init) {
         constructor(url, protocols) {
           const target = toUrl(url);
           const b = route(target, forced);
+          const headers = new Headers();
+          setHost(headers, target);
           const cookie = b.jar?.header(target.pathname);
-          super(gatewayClient(client, b), target.pathname + target.search, {
-            protocols,
-            headers: cookie ? { cookie } : undefined,
-            url: String(url),
-          });
+          if (cookie) headers.set("cookie", cookie);
+          super(gatewayClient(client, b), target.pathname + target.search, { protocols, headers, url: String(url) });
         }
       }
       class EventSource extends IrohEventSource {
@@ -100,6 +99,7 @@ export function makeCreate(init) {
           const target = toUrl(path);
           const b = route(target, forced);
           const all = new Headers(headers);
+          setHost(all, target);
           const cookie = b.jar?.header(target.pathname);
           if (cookie && !all.has("cookie")) all.set("cookie", cookie);
           return new IrohWebSocket(gatewayClient(client, b), target.pathname + target.search, {
@@ -290,6 +290,7 @@ async function fetchOverIroh(client, route, forced, input, init) {
 
   for (let hop = 0; ; hop++) {
     const sent = new Headers(headers);
+    setHost(sent, url);
     if (jar && !sent.has("cookie")) {
       const cookie = jar.header(url.pathname);
       if (cookie) sent.set("cookie", cookie);
@@ -401,6 +402,14 @@ function toRequestInput(input) {
   const s = String(input);
   // Request only accepts http(s) URLs; ws(s) URLs and bare paths are mapped onto a placeholder origin.
   return /^https?:/i.test(s) ? s : new URL(s, DEFAULT_ORIGIN).href;
+}
+
+/**
+ * Tells the gateway which host the app addressed (it becomes X-Forwarded-Host and lets one gateway
+ * route several hosts). Path-only URLs carry no host.
+ */
+function setHost(headers, url) {
+  if (url.host !== DEFAULT_HOST && !headers.has("x-iroh-host")) headers.set("x-iroh-host", url.host);
 }
 
 function headerValue(pairs, name) {

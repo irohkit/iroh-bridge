@@ -64,6 +64,45 @@ export const checks: Check[] = [
     },
   },
   {
+    name: "JWT: login, Bearer token, tampered token rejected",
+    run: async () => {
+      const login = await json(`${API}/auth/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: "demo", password: "demo" }),
+      });
+      const auth = { authorization: `Bearer ${login.token}` };
+      const me = await json(`${API}/auth/me`, { headers: auth });
+      assert(me.user === "demo", JSON.stringify(me));
+      const anon = await fetch(`${API}/auth/me`);
+      assert(anon.status === 401, `no token -> ${anon.status}`);
+      const forged = await fetch(`${API}/auth/me`, { headers: { authorization: `Bearer ${login.token.slice(0, -3)}AAA` } });
+      assert(forged.status === 401, `forged -> ${forged.status}`);
+      return `signed in as ${me.name}`;
+    },
+  },
+  {
+    name: "JWT: authenticated WebSocket (?access_token=)",
+    run: async () => {
+      const { token } = await json(`${API}/auth/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: "demo", password: "demo" }),
+      });
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(`${API.replace("https", "wss")}/ws-auth?access_token=${encodeURIComponent(token)}`);
+        const timer = setTimeout(() => (ws.close(), reject(new Error("timeout"))), 10_000);
+        ws.onmessage = (e) => {
+          clearTimeout(timer);
+          ws.close();
+          const hello = JSON.parse(e.data);
+          hello.user === "demo" ? resolve(`hello ${hello.user}`) : reject(new Error(e.data));
+        };
+        ws.onerror = () => (clearTimeout(timer), reject(new Error("websocket error")));
+      });
+    },
+  },
+  {
     name: "Backend sees the caller (X-Iroh-Remote-Id)",
     run: async ({ endpointId }) => {
       const who = await json(`${API}/whoami`);

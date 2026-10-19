@@ -1,6 +1,6 @@
 // Tiny HTTP + WebSocket backend used to try the bridge. Replace with your real backend.
 import http from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { WebSocketServer } from "ws";
 
 const port = Number(process.env.PORT ?? 8080);
@@ -8,7 +8,76 @@ const port = Number(process.env.PORT ?? 8080);
 const name = process.env.BACKEND_NAME ?? "A";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Minimal HS256 JWTs, to show token auth working over iroh exactly as over a public URL.
+const JWT_SECRET = process.env.JWT_SECRET ?? "demo-secret-change-me";
+const b64url = (buf) => Buffer.from(buf).toString("base64url");
+const hmac = (data) => createHmac("sha256", JWT_SECRET).update(data).digest();
+
+function signJwt(payload, ttlSeconds = 3600) {
+  const now = Math.floor(Date.now() / 1000);
+  const head = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const body = b64url(JSON.stringify({ ...payload, iat: now, exp: now + ttlSeconds }));
+  return `${head}.${body}.${b64url(hmac(`${head}.${body}`))}`;
+}
+
+/** Returns the payload of a valid, unexpired HS256 token, or null. */
+function verifyJwt(token) {
+  const parts = token?.split(".");
+  if (parts?.length !== 3) return null;
+  try {
+    if (JSON.parse(Buffer.from(parts[0], "base64url")).alg !== "HS256") return null;
+    const sig = Buffer.from(parts[2], "base64url");
+    const want = hmac(`${parts[0]}.${parts[1]}`);
+    if (sig.length !== want.length || !timingSafeEqual(sig, want)) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url"));
+    return payload.exp > Date.now() / 1000 ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+const bearer = (req) => /^Bearer (.+)$/i.exec(req.headers.authorization ?? "")?.[1];
+
+function unauthorized(res) {
+  res.writeHead(401, { "content-type": "application/json", "www-authenticate": 'Bearer realm="demo"' });
+  res.end(JSON.stringify({ error: "invalid or missing token" }));
+}
+
 const server = http.createServer(async (req, res) => {
+  // JWT auth: POST /auth/login {"username":"demo","password":"demo"} -> { token }; the other
+  // /auth/* routes need "Authorization: Bearer <token>".
+  if (req.url?.startsWith("/auth/")) {
+    const path = req.url.split("?")[0];
+    if (path === "/auth/login" && req.method === "POST") {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      let creds = {};
+      try {
+        creds = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      } catch {}
+      if (creds.username !== "demo" || creds.password !== "demo") return unauthorized(res);
+      const ttl = Math.min(Math.max(Number(new URL(req.url, "http://x").searchParams.get("ttl")) || 3600, 1), 86400);
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ token: signJwt({ sub: "demo", name: "Demo User", role: "admin" }, ttl), expiresIn: ttl }));
+    }
+    const user = verifyJwt(bearer(req));
+    if (!user) return unauthorized(res);
+    if (path === "/auth/me") {
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ backend: name, user: user.sub, name: user.name, role: user.role, exp: user.exp }));
+    }
+    if (path === "/auth/events") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      for (let i = 1; i <= 2; i++) {
+        res.write(`event: private\ndata: ${JSON.stringify({ n: i, user: user.sub })}\n\n`);
+        await sleep(50);
+      }
+      return res.end();
+    }
+    res.writeHead(404).end();
+    return;
+  }
+
   // Streaming upload: hash the body as it arrives instead of holding it in memory.
   if (req.url?.startsWith("/upload")) {
     const hash = createHash("sha256");
@@ -96,7 +165,24 @@ const server = http.createServer(async (req, res) => {
 });
 
 // WebSocket echo on /ws. Send "close-me" and the server closes with code 4000.
-const wss = new WebSocketServer({ server, path: "/ws", handleProtocols: (protocols) => [...protocols][0] ?? false });
+// /ws-auth needs a JWT, as "Authorization: Bearer" or ?access_token= (what browsers usually do).
+const wss = new WebSocketServer({ noServer: true, handleProtocols: (protocols) => [...protocols][0] ?? false });
+server.on("upgrade", (req, socket, head) => {
+  const url = new URL(req.url ?? "/", "http://x");
+  if (url.pathname === "/ws") return wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  if (url.pathname === "/ws-auth") {
+    const user = verifyJwt(bearer(req) ?? url.searchParams.get("access_token"));
+    if (!user) {
+      socket.end('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm="demo"\r\nContent-Length: 0\r\n\r\n');
+      return;
+    }
+    return wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.send(JSON.stringify({ hello: "authenticated", user: user.sub, backend: name }));
+      ws.on("message", (data, isBinary) => ws.send(data, { binary: isBinary }));
+    });
+  }
+  socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+});
 wss.on("connection", (ws, req) => {
   console.log("ws connected", req.headers["authorization"] ?? "");
   ws.send(JSON.stringify({ hello: "from backend", backend: name, protocol: ws.protocol }));

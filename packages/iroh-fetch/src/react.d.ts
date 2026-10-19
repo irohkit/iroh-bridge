@@ -1,5 +1,5 @@
-import type { ReactNode } from "react";
-import type { InstallOptions, IrohFetch, IrohFetchOptions } from "./index.d.ts";
+import type { ReactElement, ReactNode } from "react";
+import type { InstallOptions, IrohFetch, IrohFetchOptions } from "./index";
 
 export interface IrohProviderProps extends Partial<IrohFetchOptions> {
   children?: ReactNode;
@@ -15,7 +15,7 @@ export type IrohState =
   | { status: "ready"; client: IrohFetch; error: null; ready: Promise<IrohFetch> }
   | { status: "error"; client: null; error: Error; ready: Promise<IrohFetch> };
 
-export function IrohProvider(props: IrohProviderProps): JSX.Element;
+export function IrohProvider(props: IrohProviderProps): ReactElement;
 export function useIroh(): IrohState;
 /** A fetch that waits for the connection, so it can be used before the client is ready. */
 export function useIrohFetch(): (input: string | URL | Request, init?: RequestInit) => Promise<Response>;

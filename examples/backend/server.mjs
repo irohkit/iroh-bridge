@@ -1,11 +1,30 @@
 // Tiny HTTP + WebSocket backend used to try the bridge. Replace with your real backend.
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { WebSocketServer } from "ws";
 
 const port = Number(process.env.PORT ?? 8080);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const server = http.createServer(async (req, res) => {
+  // Streaming upload: hash the body as it arrives instead of holding it in memory.
+  if (req.url?.startsWith("/upload")) {
+    const hash = createHash("sha256");
+    let bytes = 0;
+    for await (const c of req) {
+      hash.update(c);
+      bytes += c.length;
+    }
+    res.setHeader("content-type", "application/json");
+    return res.end(JSON.stringify({ bytes, sha256: hash.digest("hex"), contentType: req.headers["content-type"] ?? null }));
+  }
+
+  // Answers after a delay, to try timeouts and aborts.
+  if (req.url?.startsWith("/slow")) {
+    await sleep(3000);
+    return res.end("finally");
+  }
+
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const body = Buffer.concat(chunks).toString();

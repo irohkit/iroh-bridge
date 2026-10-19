@@ -58,11 +58,12 @@ export class IrohClient {
      */
     endpointId(): string;
     /**
-     * Send one HTTP request. `headers` is an array of `[name, value]` pairs.
-     * Resolves to `{ status, headers, body: ReadableStream<Uint8Array> }`; the body streams
-     * in as the backend produces it.
+     * Send one HTTP request. `headers` is an array of `[name, value]` pairs and `body` is
+     * `undefined`, a `Uint8Array`, or a `ReadableStream<Uint8Array>` that is uploaded as it is read.
+     * Resolves to `{ status, headers, body: ReadableStream<Uint8Array> }`; the response body
+     * streams in as the backend produces it.
      */
-    request(method: string, path: string, headers: any, body?: Uint8Array | null): Promise<any>;
+    request(method: string, path: string, headers: any, body: any): Promise<any>;
     /**
      * Open a WebSocket to `path` on the backend. Resolves to `{ status, headers, socket }` where
      * `socket` is set only when the backend accepted the upgrade (status 101); otherwise `body`
@@ -123,7 +124,7 @@ export interface InitOutput {
     readonly irohclient_connect: (a: number) => any;
     readonly irohclient_create: (a: number, b: number, c: number, d: number) => any;
     readonly irohclient_endpointId: (a: number) => [number, number];
-    readonly irohclient_request: (a: number, b: number, c: number, d: number, e: number, f: any, g: number) => any;
+    readonly irohclient_request: (a: number, b: number, c: number, d: number, e: number, f: any, g: any) => any;
     readonly irohclient_websocket: (a: number, b: number, c: number, d: any) => any;
     readonly start: () => void;
     readonly websocketconn_close: (a: number, b: number, c: number, d: number) => any;

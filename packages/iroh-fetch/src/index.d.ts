@@ -7,6 +7,11 @@ export interface IrohFetchOptions {
   logLevel?: string;
   /** Dial the gateway immediately (default true). If false, the first request dials. */
   connect?: boolean;
+  /**
+   * How long to wait for the first connection, in ms (default 15000). When it runs out,
+   * `createIrohFetch` rejects with a `TimeoutError` instead of hanging. `0` waits forever.
+   */
+  connectTimeout?: number;
 }
 
 export interface IrohWebSocketOptions {
@@ -19,7 +24,10 @@ export interface IrohWebSocketOptions {
 export interface IrohFetch {
   /**
    * Same shape as the global fetch; pass a path such as "/api/users?page=2".
-   * The response body streams (works for SSE / NDJSON / large downloads); `init.signal` aborts it.
+   * The response body streams (works for SSE / NDJSON / large downloads). Request bodies stream too:
+   * pass a `ReadableStream<Uint8Array>`, `File` or `Blob` to upload without buffering it.
+   * `init.signal` aborts at any point, including while waiting for the response
+   * (e.g. `AbortSignal.timeout(5000)`).
    */
   fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
   /**

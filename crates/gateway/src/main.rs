@@ -19,6 +19,8 @@ use tokio_tungstenite::tungstenite::{
 };
 use tracing::{info, warn};
 
+const CHUNK_SIZE: usize = 64 * 1024;
+
 /// Hop-by-hop headers that must not be forwarded by a proxy.
 const HOP_HEADERS: &[&str] = &[
     "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te",
@@ -121,7 +123,7 @@ async fn handle_request(ctx: &Ctx, mut send: SendStream, mut recv: RecvStream) -
     if head.websocket {
         return handle_websocket(ctx, head, send, recv).await;
     }
-    let body = recv.read_to_end(ctx.max_body).await?;
+    let body = request_body(recv, ctx.max_body).await?;
 
     let resp = match forward(ctx, &head, body).await {
         Ok(resp) => resp,
@@ -247,7 +249,31 @@ fn header_pairs(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn forward(ctx: &Ctx, head: &RequestHead, body: Vec<u8>) -> Result<reqwest::Response> {
+/// Streams the rest of the QUIC stream to the backend as the request body, so uploads never
+/// sit in memory. Returns `None` for an empty body so GET requests stay body-less.
+async fn request_body(mut recv: RecvStream, max_body: usize) -> Result<Option<reqwest::Body>> {
+    let Some(first) = recv.read_chunk(CHUNK_SIZE).await? else {
+        return Ok(None);
+    };
+    let chunks = futures_util::stream::try_unfold(
+        (recv, Some(first), 0usize),
+        move |(mut recv, pending, total)| async move {
+            let chunk = match pending {
+                Some(chunk) => Some(chunk),
+                None => recv.read_chunk(CHUNK_SIZE).await.map_err(std::io::Error::other)?,
+            };
+            let Some(chunk) = chunk else { return Ok(None) };
+            let total = total + chunk.len();
+            if total > max_body {
+                return Err(std::io::Error::other(format!("request body exceeds {max_body} bytes")));
+            }
+            Ok(Some((chunk, (recv, None, total))))
+        },
+    );
+    Ok(Some(reqwest::Body::wrap_stream(chunks)))
+}
+
+async fn forward(ctx: &Ctx, head: &RequestHead, body: Option<reqwest::Body>) -> Result<reqwest::Response> {
     anyhow::ensure!(head.path.starts_with('/'), "path must start with /");
     let method = reqwest::Method::from_bytes(head.method.as_bytes())?;
     let mut req = ctx.http.request(method, format!("{}{}", ctx.backend, head.path));
@@ -256,7 +282,7 @@ async fn forward(ctx: &Ctx, head: &RequestHead, body: Vec<u8>) -> Result<reqwest
             req = req.header(k, v);
         }
     }
-    if !body.is_empty() {
+    if let Some(body) = body {
         req = req.body(body);
     }
     Ok(req.send().await?)

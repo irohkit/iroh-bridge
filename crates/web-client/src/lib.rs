@@ -12,7 +12,7 @@ use js_sys::{Object, Promise, Reflect, Uint8Array};
 use n0_future::StreamExt;
 use proto::{ALPN, RequestHead, ResponseHead, WsFrame};
 use tokio::sync::Mutex;
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::future_to_promise;
 
 const CHUNK_SIZE: usize = 64 * 1024;
@@ -73,15 +73,16 @@ impl IrohClient {
         })
     }
 
-    /// Send one HTTP request. `headers` is an array of `[name, value]` pairs.
-    /// Resolves to `{ status, headers, body: ReadableStream<Uint8Array> }`; the body streams
-    /// in as the backend produces it.
-    pub fn request(&self, method: String, path: String, headers: JsValue, body: Option<Uint8Array>) -> Promise {
+    /// Send one HTTP request. `headers` is an array of `[name, value]` pairs and `body` is
+    /// `undefined`, a `Uint8Array`, or a `ReadableStream<Uint8Array>` that is uploaded as it is read.
+    /// Resolves to `{ status, headers, body: ReadableStream<Uint8Array> }`; the response body
+    /// streams in as the backend produces it.
+    pub fn request(&self, method: String, path: String, headers: JsValue, body: JsValue) -> Promise {
         let inner = self.0.clone();
         future_to_promise(async move {
             let head = RequestHead { method, path, headers: headers_from_js(headers)?, websocket: false };
-            let body = body.map(|b| b.to_vec()).unwrap_or_default();
-            let (resp, recv) = inner.start(&head, &body).await.map_err(js_val)?;
+            let body = RequestBody::from_js(body)?;
+            let (resp, recv) = inner.start(&head, body).await.map_err(js_val)?;
             let out = response_object(&resp)?;
             Reflect::set(&out, &"body".into(), &body_stream(recv).into())?;
             Ok(out.into())
@@ -150,12 +151,74 @@ impl Inner {
         Ok((send, recv))
     }
 
-    async fn start(&self, head: &RequestHead, body: &[u8]) -> Result<(ResponseHead, RecvStream)> {
-        let (mut send, mut recv) = self.open(head).await?;
-        send.write_all(body).await?;
-        send.finish()?;
-        let resp: ResponseHead = proto::read_head(&mut recv).await?;
-        Ok((resp, recv))
+    async fn start(&self, head: &RequestHead, body: RequestBody) -> Result<(ResponseHead, RecvStream)> {
+        let (send, mut recv) = self.open(head).await?;
+        // Upload while waiting for the response so the backend may answer (or stream back)
+        // before the request body is complete.
+        let upload_error = Rc::new(std::cell::RefCell::new(None::<String>));
+        wasm_bindgen_futures::spawn_local({
+            let upload_error = upload_error.clone();
+            async move {
+                if let Err(err) = body.upload(send).await {
+                    *upload_error.borrow_mut() = Some(format!("{err:#}"));
+                }
+            }
+        });
+        match proto::read_head::<ResponseHead>(&mut recv).await {
+            Ok(resp) => Ok((resp, recv)),
+            Err(err) => match upload_error.borrow_mut().take() {
+                Some(upload) => Err(anyhow::anyhow!("uploading request body failed: {upload}")),
+                None => Err(err),
+            },
+        }
+    }
+}
+
+enum RequestBody {
+    Bytes(Vec<u8>),
+    Stream(wasm_streams::ReadableStream),
+}
+
+impl RequestBody {
+    fn from_js(body: JsValue) -> Result<Self, JsValue> {
+        if body.is_undefined() || body.is_null() {
+            return Ok(Self::Bytes(Vec::new()));
+        }
+        if let Some(bytes) = body.dyn_ref::<Uint8Array>() {
+            return Ok(Self::Bytes(bytes.to_vec()));
+        }
+        match body.dyn_into::<wasm_streams::readable::sys::ReadableStream>() {
+            Ok(stream) => Ok(Self::Stream(wasm_streams::ReadableStream::from_raw(stream))),
+            Err(_) => Err(JsError::new("body must be a Uint8Array or a ReadableStream<Uint8Array>").into()),
+        }
+    }
+
+    async fn upload(self, mut send: SendStream) -> Result<()> {
+        let res = async {
+            match self {
+                Self::Bytes(bytes) => send.write_all(&bytes).await?,
+                Self::Stream(stream) => {
+                    let mut chunks = stream.into_stream();
+                    while let Some(chunk) = chunks.next().await {
+                        let chunk = chunk.map_err(|e| anyhow::anyhow!("body stream errored: {e:?}"))?;
+                        let chunk = chunk
+                            .dyn_into::<Uint8Array>()
+                            .map_err(|_| anyhow::anyhow!("body stream chunks must be Uint8Array"))?;
+                        send.write_all(&chunk.to_vec()).await?;
+                    }
+                }
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        match res {
+            Ok(()) => send.finish()?,
+            // Abort the stream so the gateway doesn't forward a truncated body as complete.
+            Err(_) => {
+                let _ = send.reset(1u32.into());
+            }
+        }
+        res
     }
 }
 

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useIroh } from "@/lib/iroh";
 import { StreamDemo } from "./components/StreamDemo";
 import { WebSocketDemo } from "./components/WebSocketDemo";
+import { UploadDemo } from "./components/UploadDemo";
 
 export default function Home() {
   const iroh = useIroh();
@@ -61,6 +62,7 @@ export default function Home() {
       </pre>
       <StreamDemo />
       <WebSocketDemo />
+      <UploadDemo />
     </main>
   );
 }

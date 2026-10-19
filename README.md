@@ -19,7 +19,7 @@ Browser / Node.js                     iroh relay                    backend mach
   in browsers and in Node.js ≥ 22.
 - **`crates/proto`**: the shared wire format. One request (or one WebSocket) per QUIC stream; many run concurrently on one connection.
 - **`examples/nextjs`**: an example app (provider + `useIroh()` hook) with HTTP, SSE and WebSocket demos.
-- **`examples/backend`**: a mock backend to try things with (JSON echo, `/stream`, `/sse`, WebSocket echo on `/ws`).
+- **`examples/backend`**: a mock backend to try things with (JSON echo, `/stream`, `/sse`, `/upload`, `/slow`, WebSocket echo on `/ws`).
 
 > Browsers can't send UDP, so the client side always goes through a relay. Traffic is end-to-end encrypted; the relay
 > can't read it. Through n0's public relays we measured roughly 70–120 ms per request once connected.
@@ -90,6 +90,21 @@ for (;;) {
 // call ctrl.abort() to stop
 ```
 
+**Streaming uploads**: pass a `File`, `Blob` or `ReadableStream<Uint8Array>` as the body and it is sent as it is
+read, so large files never sit in memory. The gateway streams it on to the backend (still capped by `MAX_BODY_BYTES`).
+
+```ts
+await iroh.fetch("/api/files", { method: "POST", body: fileInput.files[0] });
+```
+
+**Timeouts and aborts**: `createIrohFetch` rejects with a `TimeoutError` if the gateway can't be reached within
+`connectTimeout` (default 15 s) instead of hanging, and a request's `signal` aborts at any point — including while waiting
+for the response — so `AbortSignal.timeout()` works:
+
+```ts
+const res = await iroh.fetch("/api/slow", { signal: AbortSignal.timeout(5000) });
+```
+
 **WebSocket**: returns an object with the standard `WebSocket` API (`onopen`, `onmessage`, `send`, `close`, `binaryType`,
 `protocol`, `addEventListener`). The gateway opens the real WebSocket to `ws://<BACKEND_URL>/<path>`.
 
@@ -129,7 +144,8 @@ version as in `Cargo.lock`, and optionally `wasm-opt`.
 ./scripts/build-wasm.sh
 ```
 
-End-to-end tests (start `examples/backend` and the gateway first; they cover HTTP, streaming, SSE abort and WebSocket):
+End-to-end tests (start `examples/backend` and the gateway first; they cover HTTP, streaming in both directions, aborts,
+timeouts and WebSocket):
 
 ```bash
 cd packages/iroh-fetch && IROH_ENDPOINT_ID=<id> npm test
@@ -155,7 +171,8 @@ git tag v0.1.1 && git push origin v0.1.1
   backend must do its own auth (for example with the `Authorization` header, which the gateway forwards).
   Traffic is end-to-end encrypted with QUIC/TLS.
 - **WASM size**: ~3.4 MB (~1.4 MB gzipped). Browsers cache it after the first load; load it lazily as the example does.
-- **Current limits**: request bodies (uploads) are buffered before sending, up to `MAX_BODY_BYTES`; response bodies stream.
+- **Throughput**: everything goes through a relay, so large transfers are bound by the relay. Through n0's public relays
+  we measured about 1.1 MB/s for a 20 MB upload; your own relay close to your users will do much better.
 
 ## License
 

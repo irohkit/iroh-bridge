@@ -19,11 +19,11 @@ export const ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d
 export const intounderlyingsource_cancel: (a: number) => void;
 export const intounderlyingsource_pull: (a: number, b: any) => any;
 export const irohclient_close: (a: number) => any;
-export const irohclient_connect: (a: number) => any;
-export const irohclient_create: (a: number, b: number, c: number, d: number) => any;
+export const irohclient_connect: (a: number, b: number, c: number) => any;
+export const irohclient_create: (a: number, b: number) => any;
 export const irohclient_endpointId: (a: number) => [number, number];
-export const irohclient_request: (a: number, b: number, c: number, d: number, e: number, f: any, g: any) => any;
-export const irohclient_websocket: (a: number, b: number, c: number, d: any) => any;
+export const irohclient_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: any, i: any) => any;
+export const irohclient_websocket: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
 export const start: () => void;
 export const websocketconn_close: (a: number, b: number, c: number, d: number) => any;
 export const websocketconn_recv: (a: number) => any;

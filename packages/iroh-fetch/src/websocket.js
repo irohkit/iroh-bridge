@@ -45,9 +45,9 @@ export class IrohWebSocket extends EventTarget {
   #sendQueue = Promise.resolve();
   #closeEmitted = false;
 
-  constructor(client, path, { protocols, headers } = {}) {
+  constructor(client, path, { protocols, headers, url } = {}) {
     super();
-    this.url = path;
+    this.url = url ?? path;
     const list = protocols == null ? [] : Array.isArray(protocols) ? protocols : [protocols];
     const pairs = [...new Headers(headers ?? {})];
     if (list.length) pairs.push(["sec-websocket-protocol", list.join(", ")]);

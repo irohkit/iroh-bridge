@@ -36,8 +36,8 @@ pub fn enable_logging(level: &str) {
 
 struct Inner {
     endpoint: Endpoint,
-    remote: EndpointId,
-    conn: Mutex<Option<Connection>>,
+    /// One connection per gateway, all sharing this endpoint (and its relay connection).
+    conns: std::cell::RefCell<std::collections::HashMap<EndpointId, Rc<Mutex<Option<Connection>>>>>,
 }
 
 #[wasm_bindgen]
@@ -45,17 +45,16 @@ pub struct IrohClient(Rc<Inner>);
 
 #[wasm_bindgen]
 impl IrohClient {
-    /// Create a client that talks to the gateway with the given endpoint id.
-    /// `relay_url` must match the gateway's relay if it uses a custom one.
-    pub async fn create(remote: String, relay_url: Option<String>) -> Result<IrohClient, JsError> {
-        let remote: EndpointId = remote.trim().parse().context("invalid endpoint id").map_err(js)?;
+    /// Create a local endpoint that can talk to any number of gateways.
+    /// `relay_url` must match the gateways' relay if they use a custom one.
+    pub async fn create(relay_url: Option<String>) -> Result<IrohClient, JsError> {
         let mut builder = Endpoint::builder(presets::N0);
         if let Some(url) = relay_url.filter(|u| !u.is_empty()) {
             let url: RelayUrl = url.parse().context("invalid relay url").map_err(js)?;
             builder = builder.relay_mode(RelayMode::Custom(url.into()));
         }
         let endpoint = builder.bind().await.map_err(js)?;
-        Ok(IrohClient(Rc::new(Inner { endpoint, remote, conn: Mutex::new(None) })))
+        Ok(IrohClient(Rc::new(Inner { endpoint, conns: Default::default() })))
     }
 
     /// This client's own endpoint id.
@@ -64,11 +63,11 @@ impl IrohClient {
         self.0.endpoint.id().to_string()
     }
 
-    /// Open the connection now instead of on the first request.
-    pub fn connect(&self) -> Promise {
+    /// Open the connection to the gateway `remote` now instead of on the first request.
+    pub fn connect(&self, remote: String) -> Promise {
         let inner = self.0.clone();
         future_to_promise(async move {
-            inner.connection().await.map_err(js_val)?;
+            inner.connection(parse_remote(&remote)?).await.map_err(js_val)?;
             Ok(JsValue::UNDEFINED)
         })
     }
@@ -77,12 +76,13 @@ impl IrohClient {
     /// `undefined`, a `Uint8Array`, or a `ReadableStream<Uint8Array>` that is uploaded as it is read.
     /// Resolves to `{ status, headers, body: ReadableStream<Uint8Array> }`; the response body
     /// streams in as the backend produces it.
-    pub fn request(&self, method: String, path: String, headers: JsValue, body: JsValue) -> Promise {
+    pub fn request(&self, remote: String, method: String, path: String, headers: JsValue, body: JsValue) -> Promise {
         let inner = self.0.clone();
         future_to_promise(async move {
+            let remote = parse_remote(&remote)?;
             let head = RequestHead { method, path, headers: headers_from_js(headers)?, websocket: false };
             let body = RequestBody::from_js(body)?;
-            let (resp, recv) = inner.start(&head, body).await.map_err(js_val)?;
+            let (resp, recv) = inner.start(remote, &head, body).await.map_err(js_val)?;
             let out = response_object(&resp)?;
             Reflect::set(&out, &"body".into(), &body_stream(recv).into())?;
             Ok(out.into())
@@ -92,11 +92,12 @@ impl IrohClient {
     /// Open a WebSocket to `path` on the backend. Resolves to `{ status, headers, socket }` where
     /// `socket` is set only when the backend accepted the upgrade (status 101); otherwise `body`
     /// holds the backend's error response.
-    pub fn websocket(&self, path: String, headers: JsValue) -> Promise {
+    pub fn websocket(&self, remote: String, path: String, headers: JsValue) -> Promise {
         let inner = self.0.clone();
         future_to_promise(async move {
+            let remote = parse_remote(&remote)?;
             let head = RequestHead { method: "GET".into(), path, headers: headers_from_js(headers)?, websocket: true };
-            let (send, recv) = inner.open(&head).await.map_err(js_val)?;
+            let (send, recv) = inner.open(remote, &head).await.map_err(js_val)?;
             let mut recv = recv;
             let resp: ResponseHead = proto::read_head(&mut recv).await.map_err(js_val)?;
             let out = response_object(&resp)?;
@@ -110,12 +111,15 @@ impl IrohClient {
         })
     }
 
-    /// Close the connection and the local endpoint.
+    /// Close all connections and the local endpoint.
     pub fn close(&self) -> Promise {
         let inner = self.0.clone();
         future_to_promise(async move {
-            if let Some(conn) = inner.conn.lock().await.take() {
-                conn.close(0u32.into(), b"bye");
+            let slots: Vec<_> = inner.conns.borrow_mut().drain().map(|(_, slot)| slot).collect();
+            for slot in slots {
+                if let Some(conn) = slot.lock().await.take() {
+                    conn.close(0u32.into(), b"bye");
+                }
             }
             inner.endpoint.close().await;
             Ok(JsValue::UNDEFINED)
@@ -125,34 +129,39 @@ impl IrohClient {
 
 impl Inner {
     /// Returns the live connection, dialing (again) if there is none or it was lost.
-    async fn connection(&self) -> Result<Connection> {
-        let mut guard = self.conn.lock().await;
+    async fn connection(&self, remote: EndpointId) -> Result<Connection> {
+        // Each gateway has its own slot, so dialing one doesn't hold up requests to another.
+        let slot = self.conns.borrow_mut().entry(remote).or_default().clone();
+        let mut guard = slot.lock().await;
         if let Some(conn) = guard.as_ref() {
             if conn.close_reason().is_none() {
                 return Ok(conn.clone());
             }
         }
-        let conn = self.endpoint.connect(self.remote, ALPN).await.context("connecting to gateway")?;
+        let conn = self.endpoint.connect(remote, ALPN).await.context("connecting to gateway")?;
         *guard = Some(conn.clone());
         Ok(conn)
     }
 
     /// Opens a fresh stream and sends the request head, retrying once on a stale connection.
-    async fn open(&self, head: &RequestHead) -> Result<(SendStream, RecvStream)> {
-        let conn = self.connection().await?;
+    async fn open(&self, remote: EndpointId, head: &RequestHead) -> Result<(SendStream, RecvStream)> {
+        let conn = self.connection(remote).await?;
         let (mut send, recv) = match conn.open_bi().await {
             Ok(streams) => streams,
             Err(_) => {
-                *self.conn.lock().await = None;
-                self.connection().await?.open_bi().await?
+                let slot = self.conns.borrow().get(&remote).cloned();
+                if let Some(slot) = slot {
+                    *slot.lock().await = None;
+                }
+                self.connection(remote).await?.open_bi().await?
             }
         };
         proto::write_head(&mut send, head).await?;
         Ok((send, recv))
     }
 
-    async fn start(&self, head: &RequestHead, body: RequestBody) -> Result<(ResponseHead, RecvStream)> {
-        let (send, mut recv) = self.open(head).await?;
+    async fn start(&self, remote: EndpointId, head: &RequestHead, body: RequestBody) -> Result<(ResponseHead, RecvStream)> {
+        let (send, mut recv) = self.open(remote, head).await?;
         // Upload while waiting for the response so the backend may answer (or stream back)
         // before the request body is complete.
         let upload_error = Rc::new(std::cell::RefCell::new(None::<String>));
@@ -312,6 +321,10 @@ fn body_stream(recv: RecvStream) -> wasm_streams::readable::sys::ReadableStream 
         }
     });
     wasm_streams::ReadableStream::from_stream(chunks.boxed_local()).into_raw()
+}
+
+fn parse_remote(remote: &str) -> Result<EndpointId, JsValue> {
+    remote.trim().parse().map_err(|e| JsError::new(&format!("invalid endpoint id {remote:?}: {e}")).into())
 }
 
 fn js(err: impl Into<anyhow::Error>) -> JsError {

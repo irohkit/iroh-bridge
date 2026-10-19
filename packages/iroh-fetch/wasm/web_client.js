@@ -135,7 +135,7 @@ export class IrohClient {
         wasm.__wbg_irohclient_free(ptr, 0);
     }
     /**
-     * Close the connection and the local endpoint.
+     * Close all connections and the local endpoint.
      * @returns {Promise<any>}
      */
     close() {
@@ -143,26 +143,26 @@ export class IrohClient {
         return ret;
     }
     /**
-     * Open the connection now instead of on the first request.
+     * Open the connection to the gateway `remote` now instead of on the first request.
+     * @param {string} remote
      * @returns {Promise<any>}
      */
-    connect() {
-        const ret = wasm.irohclient_connect(this.__wbg_ptr);
+    connect(remote) {
+        const ptr0 = passStringToWasm0(remote, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.irohclient_connect(this.__wbg_ptr, ptr0, len0);
         return ret;
     }
     /**
-     * Create a client that talks to the gateway with the given endpoint id.
-     * `relay_url` must match the gateway's relay if it uses a custom one.
-     * @param {string} remote
+     * Create a local endpoint that can talk to any number of gateways.
+     * `relay_url` must match the gateways' relay if they use a custom one.
      * @param {string | null} [relay_url]
      * @returns {Promise<IrohClient>}
      */
-    static create(remote, relay_url) {
-        const ptr0 = passStringToWasm0(remote, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        var ptr1 = isLikeNone(relay_url) ? 0 : passStringToWasm0(relay_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        var len1 = WASM_VECTOR_LEN;
-        const ret = wasm.irohclient_create(ptr0, len0, ptr1, len1);
+    static create(relay_url) {
+        var ptr0 = isLikeNone(relay_url) ? 0 : passStringToWasm0(relay_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len0 = WASM_VECTOR_LEN;
+        const ret = wasm.irohclient_create(ptr0, len0);
         return ret;
     }
     /**
@@ -186,32 +186,38 @@ export class IrohClient {
      * `undefined`, a `Uint8Array`, or a `ReadableStream<Uint8Array>` that is uploaded as it is read.
      * Resolves to `{ status, headers, body: ReadableStream<Uint8Array> }`; the response body
      * streams in as the backend produces it.
+     * @param {string} remote
      * @param {string} method
      * @param {string} path
      * @param {any} headers
      * @param {any} body
      * @returns {Promise<any>}
      */
-    request(method, path, headers, body) {
-        const ptr0 = passStringToWasm0(method, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    request(remote, method, path, headers, body) {
+        const ptr0 = passStringToWasm0(remote, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const ptr1 = passStringToWasm0(method, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.irohclient_request(this.__wbg_ptr, ptr0, len0, ptr1, len1, headers, body);
+        const ptr2 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.irohclient_request(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, headers, body);
         return ret;
     }
     /**
      * Open a WebSocket to `path` on the backend. Resolves to `{ status, headers, socket }` where
      * `socket` is set only when the backend accepted the upgrade (status 101); otherwise `body`
      * holds the backend's error response.
+     * @param {string} remote
      * @param {string} path
      * @param {any} headers
      * @returns {Promise<any>}
      */
-    websocket(path, headers) {
-        const ptr0 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    websocket(remote, path, headers) {
+        const ptr0 = passStringToWasm0(remote, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.irohclient_websocket(this.__wbg_ptr, ptr0, len0, headers);
+        const ptr1 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.irohclient_websocket(this.__wbg_ptr, ptr0, len0, ptr1, len1, headers);
         return ret;
     }
 }
@@ -950,7 +956,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_generic_0000000000000006: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 61, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 64, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen_e1363021040f656a___convert__closures_____invoke_______true_);
             return ret;
         },

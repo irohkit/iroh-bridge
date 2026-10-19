@@ -1,6 +1,7 @@
 //! Runs next to an existing HTTP backend (behind any NAT) and exposes it over iroh.
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{Mutex, atomic::{AtomicUsize, Ordering}},
     time::{Duration, Instant},
@@ -10,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use iroh::{
     Endpoint, EndpointId, RelayMode, RelayUrl, SecretKey,
-    endpoint::{Connection, RecvStream, SendStream, presets},
+    endpoint::{Connection, RecvStream, SendStream, VarInt, presets},
 };
 use futures_util::{SinkExt, StreamExt};
 use proto::{ALPN, RequestHead, ResponseHead, WsFrame};
@@ -41,8 +42,22 @@ const WS_HANDSHAKE_HEADERS: &[&str] = &[
 struct Args {
     /// Base URL of the HTTP backend to forward requests to. Several comma-separated URLs are
     /// load-balanced round-robin, skipping any that recently failed to accept a connection.
-    #[arg(long, env = "BACKEND_URL", default_value = "http://127.0.0.1:8080")]
-    backend: String,
+    /// With `--route`, this is the default for requests no route matches; without it, those get
+    /// a 404. [default without routes: http://127.0.0.1:8080]
+    #[arg(long, env = "BACKEND_URL")]
+    backend: Option<String>,
+    /// Route by host and path: `MATCH=UPSTREAMS`, where MATCH is `host`, `host/prefix` or
+    /// `/prefix` (host may be `*`) and UPSTREAMS is a comma-separated list like BACKEND_URL.
+    /// Repeatable; in the env var, separate entries with `;` or newlines. The most specific
+    /// match wins. The host is taken from the client's `x-iroh-host` header.
+    #[arg(long = "route", env = "IROH_ROUTES", value_delimiter = ';', value_name = "MATCH=UPSTREAMS")]
+    routes: Vec<String>,
+    /// Only accept connections from these endpoint ids (comma-separated). Default: anyone.
+    #[arg(long = "allow-client", env = "IROH_ALLOW_CLIENTS", value_delimiter = ',', value_name = "ENDPOINT_ID")]
+    allow_clients: Vec<String>,
+    /// Only serve paths under these prefixes (comma-separated); others get 403. Default: all.
+    #[arg(long = "allow-path", env = "IROH_ALLOW_PATHS", value_delimiter = ',', value_name = "PREFIX")]
+    allow_paths: Vec<String>,
     /// How long an upstream that refused a connection is skipped before it is tried again.
     #[arg(long, env = "UPSTREAM_COOLDOWN_SECS", default_value_t = 10)]
     upstream_cooldown_secs: u64,
@@ -66,7 +81,21 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
-    let upstreams = Upstreams::parse(&args.backend, Duration::from_secs(args.upstream_cooldown_secs))?;
+    let router = Router::parse(&args.routes, args.backend.as_deref(), Duration::from_secs(args.upstream_cooldown_secs))?;
+    let allow_clients = args
+        .allow_clients
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(|id| id.parse::<EndpointId>().with_context(|| format!("invalid endpoint id in allow list: {id}")))
+        .collect::<Result<HashSet<_>>>()?;
+    let allow_paths: Vec<String> = args
+        .allow_paths
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(parse_prefix)
+        .collect::<Result<_>>()?;
     let secret_key = load_or_create_key(&args.key_file)?;
 
     let mut builder = Endpoint::builder(presets::N0)
@@ -78,14 +107,28 @@ async fn main() -> Result<()> {
     let endpoint = builder.bind().await?;
     endpoint.online().await;
 
-    info!("forwarding to {}", upstreams.urls.join(", "));
+    router.log_config();
+    if !allow_clients.is_empty() {
+        let ids: Vec<_> = allow_clients.iter().map(|id| id.fmt_short().to_string()).collect();
+        info!("accepting only clients {}", ids.join(", "));
+    }
+    if !allow_paths.is_empty() {
+        info!("serving only paths under {}", allow_paths.iter().map(|p| if p.is_empty() { "/" } else { p }).collect::<Vec<_>>().join(", "));
+    }
     println!("\nIROH_ENDPOINT_ID={}\n", endpoint.id());
 
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .build()?;
-    let ctx = std::sync::Arc::new(Ctx { gateway_id: endpoint.id().to_string(), http, upstreams, max_body: args.max_body });
+    let ctx = std::sync::Arc::new(Ctx {
+        gateway_id: endpoint.id().to_string(),
+        http,
+        router,
+        allow_clients,
+        allow_paths,
+        max_body: args.max_body,
+    });
 
     loop {
         tokio::select! {
@@ -111,8 +154,156 @@ struct Ctx {
     /// replicas can tell which one answered.
     gateway_id: String,
     http: reqwest::Client,
-    upstreams: Upstreams,
+    router: Router,
+    /// Endpoint ids allowed to connect; empty means anyone.
+    allow_clients: HashSet<EndpointId>,
+    /// Path prefixes (normalized by `parse_prefix`) that may be requested; empty means all.
+    allow_paths: Vec<String>,
     max_body: usize,
+}
+
+/// Picks the upstreams for a request from its host and path.
+struct Router {
+    /// Sorted most specific first, so the first match is the best one.
+    routes: Vec<Route>,
+    /// Where requests no route matches go; `None` answers them with 404.
+    default: Option<Upstreams>,
+}
+
+struct Route {
+    /// The MATCH part as configured, for logs.
+    label: String,
+    /// Lowercase host without port; `None` matches any host.
+    host: Option<String>,
+    /// Path prefix as normalized by `parse_prefix`; empty matches every path.
+    prefix: String,
+    upstreams: Upstreams,
+}
+
+impl Router {
+    fn parse(entries: &[String], backend: Option<&str>, cooldown: Duration) -> Result<Self> {
+        let mut routes = Vec::new();
+        // clap only splits the env var on `;`, so newline-separated entries are split here.
+        for entry in entries.iter().flat_map(|e| e.lines()).map(str::trim).filter(|e| !e.is_empty()) {
+            let (matcher, list) = entry
+                .split_once('=')
+                .with_context(|| format!("route {entry:?} must look like MATCH=UPSTREAMS"))?;
+            let matcher = matcher.trim();
+            let (host, path) = match matcher.find('/') {
+                Some(i) => (&matcher[..i], &matcher[i..]),
+                None => (matcher, ""),
+            };
+            anyhow::ensure!(!host.is_empty() || !path.is_empty(), "route {entry:?} has an empty match");
+            let host = match host.to_ascii_lowercase() {
+                h if h.is_empty() || h == "*" => None,
+                h => Some(h.trim_end_matches('.').to_string()),
+            };
+            let route = Route {
+                label: matcher.to_string(),
+                host,
+                prefix: parse_prefix(if path.is_empty() { "/" } else { path })?,
+                upstreams: Upstreams::parse(list, cooldown).with_context(|| format!("route {matcher}"))?,
+            };
+            anyhow::ensure!(
+                !routes.iter().any(|r: &Route| r.host == route.host && r.prefix == route.prefix),
+                "duplicate route {matcher}"
+            );
+            routes.push(route);
+        }
+        // A host match beats any path-only match; within each group the longer prefix wins.
+        routes.sort_by_key(|r| std::cmp::Reverse((r.host.is_some(), r.prefix.len())));
+        // Without routes keep the historical default backend; with routes, an implicit default
+        // would silently expose a local service for every unknown host.
+        let default = match backend {
+            Some(list) => Some(Upstreams::parse(list, cooldown)?),
+            None if routes.is_empty() => Some(Upstreams::parse("http://127.0.0.1:8080", cooldown)?),
+            None => None,
+        };
+        Ok(Self { routes, default })
+    }
+
+    fn log_config(&self) {
+        if self.routes.is_empty() {
+            if let Some(default) = &self.default {
+                info!("forwarding to {}", default.urls.join(", "));
+            }
+            return;
+        }
+        for r in &self.routes {
+            info!("route {} -> {}", r.label, r.upstreams.urls.join(", "));
+        }
+        match &self.default {
+            Some(default) => info!("route default -> {}", default.urls.join(", ")),
+            None => info!("no default backend: unmatched requests get 404"),
+        }
+    }
+
+    /// Returns the matched route's label and upstreams. `host` must already be normalized.
+    fn select(&self, host: Option<&str>, path: &str) -> Option<(&str, &Upstreams)> {
+        self.routes
+            .iter()
+            .find(|r| r.host.as_deref().is_none_or(|h| Some(h) == host) && prefix_matches(&r.prefix, path))
+            .map(|r| (r.label.as_str(), &r.upstreams))
+            .or_else(|| self.default.as_ref().map(|d| ("default", d)))
+    }
+}
+
+/// Normalizes a configured path prefix so matching is a plain comparison: no trailing slash,
+/// and `/` becomes the empty prefix that matches everything.
+fn parse_prefix(prefix: &str) -> Result<String> {
+    anyhow::ensure!(prefix.starts_with('/'), "path prefix {prefix:?} must start with /");
+    anyhow::ensure!(!prefix.contains(['?', '#']), "path prefix {prefix:?} must not contain ? or #");
+    Ok(prefix.trim_end_matches('/').to_string())
+}
+
+/// Matches on segment boundaries, so `/admin` covers `/admin` and `/admin/x` but not
+/// `/administrator`.
+fn prefix_matches(prefix: &str, path: &str) -> bool {
+    path.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The path part of a request target, without query or fragment.
+fn path_only(target: &str) -> &str {
+    target.split(['?', '#']).next().unwrap_or_default()
+}
+
+/// Whether a path has `.`/`..` segments, also percent-encoded or with backslashes. A backend
+/// may resolve them after the gateway matched the raw path, so `/public/../admin` would slip
+/// past both routing and the path allow list. Real clients normalize these away before sending.
+fn has_dot_segment(path: &str) -> bool {
+    let decoded = path
+        .replace("%2e", ".")
+        .replace("%2E", ".")
+        .replace("%2f", "/")
+        .replace("%2F", "/")
+        .replace("%5c", "/")
+        .replace("%5C", "/")
+        .replace('\\', "/");
+    decoded.split('/').any(|s| s == "." || s == "..")
+}
+
+/// The `x-iroh-host` header as sent: the host the frontend's URL used.
+fn request_host(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-iroh-host"))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Lowercases a host and drops a port and trailing dot, so `API.example.com.:443` matches a
+/// route for `api.example.com`.
+fn normalize_host(host: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    let host = match host.strip_prefix('[') {
+        // IPv6 literal: keep the brackets, drop what follows them.
+        Some(rest) => rest.split_once(']').map_or(host.clone(), |(addr, _)| format!("[{addr}]")),
+        None => match host.rsplit_once(':') {
+            Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h.to_string(),
+            _ => host,
+        },
+    };
+    host.trim_end_matches('.').to_string()
 }
 
 /// The backends a request may go to, with passive health tracking: an upstream is only judged
@@ -175,6 +366,12 @@ impl Upstreams {
 
 async fn handle_connection(ctx: std::sync::Arc<Ctx>, conn: Connection) {
     let remote = conn.remote_id();
+    // The id is only known once the handshake has verified it, so refuse right after.
+    if !ctx.allow_clients.is_empty() && !ctx.allow_clients.contains(&remote) {
+        warn!(remote = %remote.fmt_short(), "client not in allow list, closing connection");
+        conn.close(VarInt::from_u32(1), b"not allowed");
+        return;
+    }
     info!(remote = %remote.fmt_short(), "client connected");
     // Each request arrives on its own bidirectional stream, so requests run concurrently.
     while let Ok((send, recv)) = conn.accept_bi().await {
@@ -190,27 +387,37 @@ async fn handle_connection(ctx: std::sync::Arc<Ctx>, conn: Connection) {
 
 async fn handle_request(ctx: &Ctx, remote: EndpointId, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     let mut head: RequestHead = proto::read_head(&mut recv).await?;
-    head.headers = proxy_headers(head.headers, remote);
+    let method = if head.websocket { "WS" } else { head.method.as_str() };
+    let host = request_host(&head.headers);
+    let path = path_only(&head.path);
+    // Routing and the allow list both look at the path, so reject anything they could misread
+    // before either runs. WebSockets get the same checks, before any upstream is contacted.
+    if !path.starts_with('/') || has_dot_segment(path) {
+        info!("{method} {} -> 400 (invalid path)", head.path);
+        return respond_text(ctx, &mut send, 400, "bad request: invalid path").await;
+    }
+    if !ctx.allow_paths.is_empty() && !ctx.allow_paths.iter().any(|p| prefix_matches(p, path)) {
+        info!("{method} {} -> 403 (path not allowed)", head.path);
+        return respond_text(ctx, &mut send, 403, "forbidden").await;
+    }
+    let Some((route, upstreams)) = ctx.router.select(host.as_deref().map(normalize_host).as_deref(), path) else {
+        info!("{method} {} -> 404 (no route for host {})", head.path, host.as_deref().unwrap_or("-"));
+        return respond_text(ctx, &mut send, 404, "no route for this host or path").await;
+    };
+    head.headers = proxy_headers(head.headers, remote, host.as_deref());
     if head.websocket {
-        return handle_websocket(ctx, head, send, recv).await;
+        return handle_websocket(upstreams, route, head, send, recv).await;
     }
     let body = request_body(recv, ctx.max_body).await?;
 
-    let (resp, upstream) = match forward_any(ctx, &head, body).await {
+    let (resp, upstream) = match forward_any(ctx, upstreams, &head, body).await {
         Ok(ok) => ok,
         Err(err) => {
-            warn!("{} {} -> backend error: {err:#}", head.method, head.path);
-            let head = ResponseHead {
-                status: 502,
-                headers: vec![("content-type".into(), "text/plain".into()), ("x-iroh-gateway-id".into(), ctx.gateway_id.clone())],
-            };
-            proto::write_head(&mut send, &head).await?;
-            send.write_all(format!("bad gateway: {err}").as_bytes()).await?;
-            send.finish()?;
-            return Ok(());
+            warn!("{} {} -> backend error (route {route}): {err:#}", head.method, head.path);
+            return respond_text(ctx, &mut send, 502, &format!("bad gateway: {err}")).await;
         }
     };
-    info!("{} {} -> {} via {upstream}", head.method, head.path, resp.status().as_u16());
+    info!("{} {} -> {} via {upstream} (route {route})", head.method, head.path, resp.status().as_u16());
 
     let mut headers = header_pairs(resp.headers());
     headers.push(("x-iroh-gateway-id".into(), ctx.gateway_id.clone()));
@@ -225,12 +432,11 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, mut send: SendStream, mut
     Ok(())
 }
 
-async fn handle_websocket(ctx: &Ctx, head: RequestHead, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
-    anyhow::ensure!(head.path.starts_with('/'), "path must start with /");
+async fn handle_websocket(upstreams: &Upstreams, route: &str, head: RequestHead, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     // A handshake has no body, so a connect failure can always move on to the next upstream.
     let mut attempt = None;
-    for i in ctx.upstreams.order() {
-        let upstream = &ctx.upstreams.urls[i];
+    for i in upstreams.order() {
+        let upstream = &upstreams.urls[i];
         let req = ws_request(upstream, &head)?;
         let res = match tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(req)).await {
             Ok(res) => res,
@@ -238,11 +444,11 @@ async fn handle_websocket(ctx: &Ctx, head: RequestHead, mut send: SendStream, mu
         };
         match res {
             Err(err @ tungstenite::Error::Io(_)) => {
-                ctx.upstreams.mark_failed(i, &err);
+                upstreams.mark_failed(i, &err);
                 attempt = Some((upstream, Err(err)));
             }
             res => {
-                ctx.upstreams.mark_ok(i);
+                upstreams.mark_ok(i);
                 attempt = Some((upstream, res));
                 break;
             }
@@ -262,14 +468,14 @@ async fn handle_websocket(ctx: &Ctx, head: RequestHead, mut send: SendStream, mu
                 ),
                 err => (502, vec![("content-type".into(), "text/plain".into())], format!("bad gateway: {err}").into_bytes()),
             };
-            warn!("WS {} -> {status} via {upstream}", head.path);
+            warn!("WS {} -> {status} via {upstream} (route {route})", head.path);
             proto::write_head(&mut send, &ResponseHead { status, headers }).await?;
             send.write_all(&body).await?;
             send.finish()?;
             return Ok(());
         }
     };
-    info!("WS {} -> 101 via {upstream}", head.path);
+    info!("WS {} -> 101 via {upstream} (route {route})", head.path);
     let headers = header_pairs(resp.headers())
         .into_iter()
         .filter(|(k, _)| !WS_HANDSHAKE_HEADERS.contains(&k.as_str()))
@@ -329,6 +535,18 @@ async fn handle_websocket(ctx: &Ctx, head: RequestHead, mut send: SendStream, mu
     res
 }
 
+/// Answers a request with a short plain-text body, for errors the gateway produces itself.
+async fn respond_text(ctx: &Ctx, send: &mut SendStream, status: u16, body: &str) -> Result<()> {
+    let head = ResponseHead {
+        status,
+        headers: vec![("content-type".into(), "text/plain".into()), ("x-iroh-gateway-id".into(), ctx.gateway_id.clone())],
+    };
+    proto::write_head(send, &head).await?;
+    send.write_all(body.as_bytes()).await?;
+    send.finish()?;
+    Ok(())
+}
+
 fn ws_request(upstream: &str, head: &RequestHead) -> Result<tungstenite::handshake::client::Request> {
     let base = upstream.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
     let mut req = format!("{base}{}", head.path).into_client_request()?;
@@ -375,31 +593,43 @@ async fn request_body(mut recv: RecvStream, max_body: usize) -> Result<Option<re
 }
 
 /// Headers set by the gateway itself. Clients can't supply them, so the backend can trust them.
-const GATEWAY_HEADERS: &[&str] = &["x-iroh-remote-id", "x-forwarded-proto", "x-forwarded-for", "x-forwarded-host", "forwarded"];
+/// `x-iroh-host` is the client's routing hint; it reaches the backend as `X-Forwarded-Host`.
+const GATEWAY_HEADERS: &[&str] = &[
+    "x-iroh-remote-id", "x-forwarded-proto", "x-forwarded-for", "x-forwarded-host", "forwarded", "x-iroh-host",
+];
 
 /// Drops headers a client must not spoof and adds what a reverse proxy normally adds:
 /// `X-Iroh-Remote-Id` (the caller's endpoint id, verified by the QUIC handshake) and
-/// `X-Forwarded-Proto: https` (the tunnel is end-to-end encrypted).
-fn proxy_headers(headers: Vec<(String, String)>, remote: EndpointId) -> Vec<(String, String)> {
+/// `X-Forwarded-Proto: https` (the tunnel is end-to-end encrypted), plus `X-Forwarded-Host`
+/// when the client said which host it used.
+fn proxy_headers(headers: Vec<(String, String)>, remote: EndpointId, host: Option<&str>) -> Vec<(String, String)> {
     let mut out: Vec<_> = headers
         .into_iter()
         .filter(|(k, _)| !GATEWAY_HEADERS.contains(&k.to_ascii_lowercase().as_str()))
         .collect();
     out.push(("x-iroh-remote-id".into(), remote.to_string()));
     out.push(("x-forwarded-proto".into(), "https".into()));
+    if let Some(host) = host {
+        out.push(("x-forwarded-host".into(), host.to_string()));
+    }
     out
 }
 
 /// Sends the request to the first upstream that accepts a connection. Only body-less requests
 /// fail over: a streamed body is consumed by the first attempt and can't be sent again.
-async fn forward_any<'a>(ctx: &'a Ctx, head: &RequestHead, mut body: Option<reqwest::Body>) -> Result<(reqwest::Response, &'a str)> {
+async fn forward_any<'a>(
+    ctx: &Ctx,
+    upstreams: &'a Upstreams,
+    head: &RequestHead,
+    mut body: Option<reqwest::Body>,
+) -> Result<(reqwest::Response, &'a str)> {
     let mut last_err = None;
-    for i in ctx.upstreams.order() {
-        let upstream = &ctx.upstreams.urls[i];
+    for i in upstreams.order() {
+        let upstream = &upstreams.urls[i];
         let replayable = body.is_none();
         match forward(ctx, upstream, head, body.take()).await {
             Ok(resp) => {
-                ctx.upstreams.mark_ok(i);
+                upstreams.mark_ok(i);
                 return Ok((resp, upstream));
             }
             Err(err) => {
@@ -407,7 +637,7 @@ async fn forward_any<'a>(ctx: &'a Ctx, head: &RequestHead, mut body: Option<reqw
                 if !connect {
                     return Err(err);
                 }
-                ctx.upstreams.mark_failed(i, &format!("{err:#}"));
+                upstreams.mark_failed(i, &format!("{err:#}"));
                 if !replayable {
                     return Err(err);
                 }

@@ -1,0 +1,18 @@
+name: npm-deprecate-once
+# One-off: marks broken early versions as deprecated. Removed right after it runs.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  deprecate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: |
+          npm deprecate iroh-fetch@0.1.0 "Broken WASM build; use 0.1.1 or later"
+          npm deprecate iroh-fetch@0.0.0-stage "Placeholder from the first publish; use 0.1.1 or later"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

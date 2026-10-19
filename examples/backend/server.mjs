@@ -43,7 +43,16 @@ function unauthorized(res) {
   res.end(JSON.stringify({ error: "invalid or missing token" }));
 }
 
-const server = http.createServer(async (req, res) => {
+// A client that disconnects mid-upload makes reading the body throw ("aborted"); catch it per
+// request instead of letting the unhandled rejection take the whole process down.
+const server = http.createServer((req, res) => {
+  handle(req, res).catch((err) => {
+    console.warn(`${req.method} ${req.url}: ${err.message}`);
+    res.destroy();
+  });
+});
+
+async function handle(req, res) {
   // JWT auth: POST /auth/login {"username":"demo","password":"demo"} -> { token }; the other
   // /auth/* routes need "Authorization: Bearer <token>".
   if (req.url?.startsWith("/auth/")) {
@@ -162,7 +171,7 @@ const server = http.createServer(async (req, res) => {
 
   res.setHeader("content-type", "application/json");
   res.end(JSON.stringify({ backend: name, method: req.method, url: req.url, headers: req.headers, body, time: new Date().toISOString() }));
-});
+}
 
 // WebSocket echo on /ws. Send "close-me" and the server closes with code 4000.
 // /ws-auth needs a JWT, as "Authorization: Bearer" or ?access_token= (what browsers usually do).

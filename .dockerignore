@@ -1,0 +1,14 @@
+# Keep the Docker build context small. Only Cargo.toml, Cargo.lock and
+# crates/ are needed to build the iroh-gateway image.
+.git
+.github
+target
+**/target
+node_modules
+**/node_modules
+.next
+**/.next
+packages/iroh-fetch/wasm
+*.key
+**/*.key
+.env*

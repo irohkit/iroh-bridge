@@ -1,0 +1,44 @@
+# Example: expose a placeholder HTTP backend over iroh.
+#
+#   cd deploy/docker
+#   docker compose up -d            # pulls ghcr.io/irohkit/iroh-gateway:latest
+#   docker compose up -d --build    # or builds the image from this checkout
+#
+# Read the endpoint id (clients connect to it):
+#   docker compose logs gateway | grep IROH_ENDPOINT_ID
+#
+# The secret key is stored in the `gateway-data` volume, so the endpoint id
+# stays the same across restarts and upgrades. `docker compose down -v`
+# deletes the volume and therefore gives you a new endpoint id.
+#
+# Replace `backend` with your own service. It does not need to publish any
+# ports: the gateway reaches it over the compose network.
+
+services:
+  backend:
+    image: traefik/whoami:latest
+    restart: unless-stopped
+    command: ["--port", "8080"]
+
+  gateway:
+    image: ghcr.io/irohkit/iroh-gateway:latest
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      # Comma-separate several URLs to load-balance, e.g.
+      # BACKEND_URL: http://backend-1:8080,http://backend-2:8080
+      BACKEND_URL: http://backend:8080
+      RUST_LOG: iroh_gateway=info
+      # IROH_RELAY_URL: https://relay.example.com
+      # MAX_BODY_BYTES: "33554432"
+      # UPSTREAM_COOLDOWN_SECS: "10"
+    volumes:
+      - gateway-data:/data
+    # No ports: the gateway only needs outbound UDP and HTTPS.
+
+volumes:
+  gateway-data:

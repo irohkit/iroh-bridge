@@ -58,7 +58,7 @@ test("WebSocket text, binary, subprotocol and server close", opts, async () => {
   ws.send("close-me");
   const ev = await closed;
 
-  assert.deepEqual(JSON.parse(messages[0]), { hello: "from backend", protocol: "chat.v1" });
+  assert.deepEqual(JSON.parse(messages[0]), { hello: "from backend", backend: "A", protocol: "chat.v1" });
   assert.equal(messages[1], "hi");
   assert.deepEqual([...new Uint8Array(messages[2])], [1, 2, 3]);
   assert.equal(ev.code, 4000);

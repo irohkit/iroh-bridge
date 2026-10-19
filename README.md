@@ -140,6 +140,13 @@ repository, set the Root Directory to `examples/nextjs`; the prebuilt WASM in `p
 again (~1 s). If you call it often from the server, keep the client in a module-level variable so it is reused, or run on a
 long-lived server.
 
+### Troubleshooting
+
+- **`TimeoutError: could not reach gateway`**: the gateway is offline, or the endpoint id is wrong or old. Check
+  `journalctl -u iroh-gateway` (or the gateway's output) for the current `IROH_ENDPOINT_ID`.
+- **Node.js: `address lookup ... fetch failed` / `ETIMEDOUT`**: usually a machine whose IPv6 is configured but doesn't
+  actually work, so Node's `fetch` stalls on IPv6. Run Node with `NODE_OPTIONS=--dns-result-order=ipv4first`.
+
 ## Building the package
 
 You need Rust with the `wasm32-unknown-unknown` target, `clang` (for the `ring` crate), `wasm-bindgen-cli` at the same

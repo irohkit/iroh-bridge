@@ -29,7 +29,11 @@
       "default": "./src/react.js"
     }
   },
+  "bin": {
+    "iroh-proxy": "bin/iroh-proxy.js"
+  },
   "files": [
+    "bin",
     "src",
     "wasm/web_client.js",
     "wasm/web_client.d.ts",

@@ -10,6 +10,8 @@ const MAX_REDIRECTS = 20;
 // Used as the origin for path-only requests such as fetch("/api/users").
 const DEFAULT_ORIGIN = "http://iroh.invalid";
 const DEFAULT_HOST = "iroh.invalid";
+// URL schemes install() may route; anything else (data:, blob:, file:, ...) is never sent to a gateway.
+const ROUTABLE_PROTOCOLS = new Set(["http:", "https:", "ws:", "wss:"]);
 
 /**
  * @param {() => Promise<void>} init loads the WASM module for the current runtime
@@ -349,8 +351,16 @@ async function fetchOverIroh(client, route, forced, input, init) {
  * URLs, so existing code and libraries keep working unchanged. Returns an uninstall function.
  */
 function install(impl, { origins = [], match, websocket = true, eventSource = true } = {}) {
-  const wanted = origins.map((o) => new URL(o, globalThis.location?.href).host);
-  const matches = match ?? ((url) => wanted.includes(url.host));
+  // Origins must be absolute: a bare "api.example.com" would resolve against the page's URL and
+  // silently send the page's own origin (and its credentials) to the gateway.
+  const wanted = origins.map((o) => {
+    try {
+      return new URL(o).host;
+    } catch {
+      throw new TypeError(`iroh-fetch: install() origins must be absolute URLs such as "https://api.example.com", got ${JSON.stringify(o)}`);
+    }
+  });
+  const matches = match ?? ((url) => ROUTABLE_PROTOCOLS.has(url.protocol) && wanted.includes(url.host));
   const test = (u) => {
     try {
       return matches(new URL(String(u), globalThis.location?.href ?? DEFAULT_ORIGIN));

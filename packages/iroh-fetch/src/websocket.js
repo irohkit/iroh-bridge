@@ -6,6 +6,17 @@ const OPEN = 1;
 const CLOSING = 2;
 const CLOSED = 3;
 
+function validCloseCode(code) {
+  return Number.isInteger(code) && ((code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999));
+}
+
+function truncateUtf8(text, max) {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length <= max) return text;
+  // Decoding a cut-off sequence would add U+FFFD; drop the partial character instead.
+  return new TextDecoder().decode(bytes.subarray(0, max)).replace(/\uFFFD$/, "");
+}
+
 function makeEvent(type, props) {
   const Ctor =
     type === "message" && typeof MessageEvent === "function"
@@ -123,6 +134,10 @@ export class IrohWebSocket extends EventTarget {
 
   close(code = 1000, reason = "") {
     if (this.readyState === CLOSING || this.readyState === CLOSED) return;
+    // Only codes an endpoint may put on the wire, and a reason that fits a control frame
+    // (RFC 6455 5.5, 7.4), so the gateway never has to forward an invalid close frame.
+    if (!validCloseCode(code)) code = 1000;
+    reason = truncateUtf8(String(reason), 123);
     const wasConnecting = this.readyState === CONNECTING;
     this.readyState = CLOSING;
     if (wasConnecting) return; // #start finishes the close once connected

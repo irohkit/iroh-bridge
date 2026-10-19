@@ -58,7 +58,10 @@ export interface IrohWebSocketOptions {
 }
 
 export interface InstallOptions {
-  /** Origins whose requests go through iroh, e.g. ["https://api.example.com"] (default: the `backends` origins). */
+  /**
+   * Origins whose requests go through iroh, e.g. ["https://api.example.com"] (default: the `backends` origins).
+   * Must be absolute URLs; only http(s) and ws(s) URLs on these hosts are routed.
+   */
   origins?: string[];
   /** Custom matcher instead of `origins`. */
   match?: (url: URL) => boolean;

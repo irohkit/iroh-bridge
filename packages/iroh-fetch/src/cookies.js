@@ -1,5 +1,11 @@
 // A small cookie jar so cookie-based sessions work over iroh. Browsers never see these
-// responses as real HTTP, so they can't store the cookies themselves.
+// responses as real HTTP, so they can't store the cookies themselves. Each backend has its own
+// jar and `Domain` is ignored on purpose: a cookie only ever goes back to the backend that set it.
+
+// Browser-like limits, so a backend can't grow the jar (and every request's Cookie header)
+// without bound.
+const MAX_COOKIES = 180;
+const MAX_COOKIE_BYTES = 4096;
 
 export class CookieJar {
   /** @type {Map<string, { value: string, path: string, expires: number }>} */
@@ -13,7 +19,12 @@ export class CookieJar {
     this.#key = persist?.key;
     if (this.#storage) {
       try {
-        for (const [name, c] of JSON.parse(this.#storage.getItem(this.#key) ?? "[]")) this.#cookies.set(name, c);
+        for (const [name, c] of JSON.parse(this.#storage.getItem(this.#key) ?? "[]")) {
+          // Storage is shared with page scripts; skip anything that isn't a cookie we wrote.
+          if (typeof name === "string" && typeof c?.value === "string" && typeof c.path === "string") {
+            this.#cookies.set(name, { value: c.value, path: c.path, expires: Number(c.expires ?? Infinity) });
+          }
+        }
       } catch {}
     }
   }
@@ -22,7 +33,7 @@ export class CookieJar {
   store(headerPairs, requestPath) {
     let changed = false;
     for (const [name, value] of headerPairs) {
-      if (name.toLowerCase() !== "set-cookie") continue;
+      if (name.toLowerCase() !== "set-cookie" || value.length > MAX_COOKIE_BYTES) continue;
       const [pair, ...attrs] = value.split(";");
       const eq = pair.indexOf("=");
       if (eq <= 0) continue;
@@ -36,7 +47,8 @@ export class CookieJar {
             if (v.startsWith("/")) cookie.path = v;
             break;
           case "max-age":
-            cookie.expires = Date.now() + Number(v) * 1000;
+            // RFC 6265 5.2.2: digits with an optional minus; anything else is ignored.
+            if (/^-?\d+$/.test(v)) cookie.expires = Date.now() + Number(v) * 1000;
             break;
           case "expires":
             if (cookie.expires === Infinity) cookie.expires = Date.parse(v) || Infinity;
@@ -44,7 +56,11 @@ export class CookieJar {
         }
       }
       if (cookie.expires <= Date.now()) this.#cookies.delete(key);
-      else this.#cookies.set(key, cookie);
+      else {
+        // Replace in place, or evict the oldest one when the jar is full.
+        if (!this.#cookies.has(key) && this.#cookies.size >= MAX_COOKIES) this.#cookies.delete(this.#cookies.keys().next().value);
+        this.#cookies.set(key, cookie);
+      }
       changed = true;
     }
     if (changed) this.#save();

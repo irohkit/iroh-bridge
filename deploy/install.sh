@@ -13,11 +13,19 @@ cd "$(dirname "$0")/.."
 BACKEND_URL="${1:-http://127.0.0.1:8080}"
 BIN="${2:-target/release/iroh-gateway}"
 [ -x "$BIN" ] || { echo "no gateway binary at $BIN" >&2; exit 1; }
+# The URL is written into the unit file, so refuse anything that could end the line or break
+# the sed expression below: whitespace, control characters and '#'.
+[[ "$BACKEND_URL" =~ ^https?:// && "$BACKEND_URL" != *[[:space:][:cntrl:]#\\]* ]] \
+  || { echo "invalid BACKEND_URL: $BACKEND_URL" >&2; exit 1; }
 
 id iroh-gateway >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin iroh-gateway
-install -m 755 "$BIN" /usr/local/bin/iroh-gateway
-sed "s#^Environment=BACKEND_URL=.*#Environment=BACKEND_URL=$BACKEND_URL#" deploy/iroh-gateway.service \
+install -o root -g root -m 755 "$BIN" /usr/local/bin/iroh-gateway
+# `&` is special in a sed replacement and `%` starts a systemd specifier; escape both.
+UNIT_URL="${BACKEND_URL//%/%%}"
+UNIT_URL="${UNIT_URL//&/\\&}"
+sed "s#^Environment=BACKEND_URL=.*#Environment=BACKEND_URL=$UNIT_URL#" deploy/iroh-gateway.service \
   > /etc/systemd/system/iroh-gateway.service
+chmod 644 /etc/systemd/system/iroh-gateway.service
 systemctl daemon-reload
 systemctl enable --now iroh-gateway
 

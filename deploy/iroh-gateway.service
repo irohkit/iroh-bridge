@@ -13,11 +13,45 @@ Environment=RUST_LOG=iroh_gateway=info
 ExecStart=/usr/local/bin/iroh-gateway
 Restart=always
 RestartSec=2
+# SIGTERM shuts the gateway down cleanly; give it a moment to close its connections.
+TimeoutStopSec=10
 StateDirectory=iroh-gateway
+StateDirectoryMode=0700
+UMask=0077
+
+# Sandboxing. The gateway only needs outbound UDP/TCP (iroh, relays, backends), DNS and its
+# state directory, so everything else is taken away. `systemd-analyze security iroh-gateway`
+# shows the result.
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+# AF_NETLINK lets iroh discover the machine's interfaces and addresses for direct connections.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+# Optional resource caps, on top of the gateway's own limits (see `iroh-gateway --help`):
+#LimitNOFILE=65536
+#MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target

@@ -12,6 +12,18 @@ export interface BackendConfig {
   default?: boolean;
 }
 
+export interface CacheOptions {
+  /** Most responses kept (default 500); the least recently used go first. */
+  maxEntries?: number;
+  /** Most bytes kept, bodies plus headers (default 50 MB). Larger responses are not stored. */
+  maxBytes?: number;
+  /**
+   * "memory" (default): gone on reload. "cache-api": the browser's Cache API, kept across reloads
+   * (falls back to memory where it's missing, e.g. Node or plain-http pages).
+   */
+  storage?: "memory" | "cache-api";
+}
+
 export interface IrohFetchOptions {
   /** Endpoint id printed by `iroh-gateway` on startup. Use this or `backends`. */
   endpointId?: string;
@@ -68,6 +80,14 @@ export interface IrohFetchOptions {
    * Off by default: unlike real cookies, stored values are readable by page scripts (no HttpOnly).
    */
   persistCookies?: boolean | Storage;
+  /**
+   * Cache GET / HEAD responses on the client like a browser's HTTP cache (off by default). Requests
+   * over iroh skip the browser's cache, so otherwise every GET crosses the relay again. Honours
+   * Cache-Control (max-age, no-store, no-cache, public, private), Expires, ETag / Last-Modified
+   * revalidation, Vary and `RequestInit.cache`. Requests with Authorization or cookies are only
+   * cached when the response says `public`.
+   */
+  cache?: boolean | CacheOptions;
 }
 
 export interface IrohWebSocketOptions {
@@ -144,6 +164,8 @@ export interface IrohFetch {
   objectUrl(url: string | URL, init?: RequestInit): Promise<string>;
   /** This client's secret key (hex): pass it as `secretKey` later to keep the same endpoint id. */
   exportSecretKey(): string;
+  /** Empties the HTTP cache (the `cache` option), e.g. on logout. */
+  clearCache(): Promise<void>;
   /**
    * Route the global fetch (and WebSocket / EventSource / XMLHttpRequest) for matching URLs through iroh, so existing
    * code and libraries work unchanged. Returns a function that undoes it.

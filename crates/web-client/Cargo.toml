@@ -9,8 +9,7 @@ repository = "https://github.com/irohkit/iroh-bridge"
 crate-type = ["cdylib"]
 
 [dependencies]
-proto = { path = "../proto" }
-iroh.workspace = true
+client-core = { path = "../client-core" }
 anyhow.workspace = true
 tracing.workspace = true
 getrandom = { version = "0.3", features = ["wasm_js"] }
@@ -21,6 +20,5 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 n0-future = "0.3"
-tokio = { version = "1", default-features = false, features = ["sync"] }
 serde-wasm-bindgen = "0.6"
 wasm-streams = "0.5"

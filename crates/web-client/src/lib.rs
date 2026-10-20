@@ -1,21 +1,16 @@
 //! iroh HTTP client compiled to WebAssembly. Runs in browsers and in Node.js >= 22.
 //! Browsers can't send raw UDP, so connections always go through an iroh relay.
+//! The protocol logic lives in `client-core`; this crate only maps it to JS values.
+//! Native Node.js uses `node-client` instead; built for any other target this crate is empty.
+#![cfg(target_family = "wasm")]
 
-use std::{rc::Rc, time::Duration};
+use std::rc::Rc;
 
-use anyhow::{Context, Result};
-use iroh::{
-    Endpoint, EndpointId, RelayMode,
-    endpoint::{Connection, RecvStream, SendStream, presets},
-};
+use client_core::{Body, Client, Options, Profile, RequestHead, ResponseBody, ResponseHead, WsFrame, WsOutcome};
 use js_sys::{Object, Promise, Reflect, Uint8Array};
 use n0_future::StreamExt;
-use proto::{ALPN, RequestHead, ResponseHead, WsFrame};
-use tokio::sync::Mutex;
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::future_to_promise;
-
-const CHUNK_SIZE: usize = 64 * 1024;
 
 #[wasm_bindgen(start)]
 fn start() {
@@ -34,18 +29,8 @@ pub fn enable_logging(level: &str) {
         .try_init();
 }
 
-struct Inner {
-    endpoint: Endpoint,
-    /// The relays this client was configured with. Dialing a gateway "via" them lets the
-    /// connection start right away instead of waiting for an address lookup (which also keeps
-    /// running, so a gateway on another relay is still found).
-    relay_hints: Vec<iroh::RelayUrl>,
-    /// One connection per gateway, all sharing this endpoint (and its relay connection).
-    conns: std::cell::RefCell<std::collections::HashMap<EndpointId, Rc<Mutex<Option<Connection>>>>>,
-}
-
 #[wasm_bindgen]
-pub struct IrohClient(Rc<Inner>);
+pub struct IrohClient(Rc<Client>);
 
 #[wasm_bindgen]
 impl IrohClient {
@@ -60,67 +45,43 @@ impl IrohClient {
         relay_token: Option<String>,
         secret_key: Option<String>,
     ) -> Result<IrohClient, JsError> {
-        // Like the N0 preset, but clients only look addresses up: nobody dials a client, so
-        // publishing its address would just cost every page load a DNS round trip.
-        let mut builder = Endpoint::builder(presets::Minimal)
-            .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns())
-            .relay_mode(RelayMode::Default)
-            // Notice a dead relay or gateway within seconds instead of the ~30 s defaults, so
-            // requests fail over to another replica quickly. Keep-alives over a relay are cheap.
-            .transport_config(
-                iroh::endpoint::QuicTransportConfig::builder()
-                    .keep_alive_interval(Duration::from_secs(1))
-                    .default_path_keep_alive_interval(Duration::from_secs(1))
-                    .default_path_max_idle_timeout(Duration::from_secs(4))
-                    .max_idle_timeout(Some(Duration::from_secs(5).try_into().expect("valid idle timeout")))
-                    .build(),
-            );
-        let mut relay_hints = Vec::new();
-        if let Some(hex) = secret_key.filter(|k| !k.is_empty()) {
-            builder = builder.secret_key(parse_secret_key(&hex).map_err(js)?);
-        }
-        if let Some(spec) = relay_url.filter(|u| !u.is_empty()) {
-            // In the browser the token travels as `?token=` on the relay WebSocket URL.
-            let map = proto::relay_map(&spec, relay_token.as_deref()).map_err(js)?;
-            relay_hints = proto::listed_relays(&spec);
-            builder = builder.relay_mode(RelayMode::Custom(map));
-        }
-        let endpoint = builder.bind().await.map_err(js)?;
-        Ok(IrohClient(Rc::new(Inner { endpoint, relay_hints, conns: Default::default() })))
+        let client = Client::create(Profile::Browser, Options { relay_url, relay_token, secret_key }).await.map_err(js)?;
+        Ok(IrohClient(Rc::new(client)))
     }
 
     /// Why the home relay can't be used, if it can't: e.g. it refused the relay token. `None`
     /// while the relay is fine or nothing has failed yet.
     #[wasm_bindgen(js_name = relayProblem)]
     pub fn relay_problem(&self) -> Option<String> {
-        use iroh::Watcher;
-        let statuses = self.0.endpoint.home_relay_status().get();
-        statuses.iter().find_map(|status| {
-            if let Some(reason) = status.auth_denied_reason() {
-                return Some(format!("relay {} refused this client: {reason}", status.url()));
-            }
-            status.last_error().map(|err| format!("relay {} is unreachable: {err}", status.url()))
-        })
+        self.0.relay_problem()
     }
 
     /// This client's secret key as hex, to keep its endpoint id across sessions. Treat it like a
     /// password: whoever has it can act as this client.
     #[wasm_bindgen(js_name = secretKey)]
     pub fn secret_key(&self) -> String {
-        self.0.endpoint.secret_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect()
+        self.0.secret_key()
     }
 
     /// This client's own endpoint id.
     #[wasm_bindgen(js_name = endpointId)]
     pub fn endpoint_id(&self) -> String {
-        self.0.endpoint.id().to_string()
+        self.0.endpoint_id()
+    }
+
+    /// The network paths of the connection to `remote`: `{ kind: "relay" | "direct" | "none",
+    /// paths: [{ kind, addr, selected, rttMs }] }`, or `null` without a connection.
+    #[wasm_bindgen(js_name = connectionInfo)]
+    pub fn connection_info(&self, remote: String) -> Result<JsValue, JsError> {
+        let info = self.0.connection_info(&remote).map_err(js)?;
+        serde_wasm_bindgen::to_value(&info).map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Open the connection to the gateway `remote` now instead of on the first request.
     pub fn connect(&self, remote: String) -> Promise {
-        let inner = self.0.clone();
+        let client = self.0.clone();
         future_to_promise(async move {
-            inner.connection(parse_remote(&remote)?).await.map_err(js_val)?;
+            client.connect(&remote).await.map_err(js_val)?;
             Ok(JsValue::UNDEFINED)
         })
     }
@@ -130,14 +91,13 @@ impl IrohClient {
     /// Resolves to `{ status, headers, body: ReadableStream<Uint8Array> }`; the response body
     /// streams in as the backend produces it.
     pub fn request(&self, remote: String, method: String, path: String, headers: JsValue, body: JsValue) -> Promise {
-        let inner = self.0.clone();
+        let client = self.0.clone();
         future_to_promise(async move {
-            let remote = parse_remote(&remote)?;
             let head = RequestHead { method, path, headers: headers_from_js(headers)?, websocket: false };
-            let body = RequestBody::from_js(body)?;
-            let (resp, recv) = inner.start(remote, &head, body).await.map_err(js_val)?;
+            let body = body_from_js(body)?;
+            let (resp, body) = client.request(&remote, head, body).await.map_err(js_val)?;
             let out = response_object(&resp)?;
-            Reflect::set(&out, &"body".into(), &body_stream(recv).into())?;
+            Reflect::set(&out, &"body".into(), &body_stream(body).into())?;
             Ok(out.into())
         })
     }
@@ -146,178 +106,60 @@ impl IrohClient {
     /// `socket` is set only when the backend accepted the upgrade (status 101); otherwise `body`
     /// holds the backend's error response.
     pub fn websocket(&self, remote: String, path: String, headers: JsValue) -> Promise {
-        let inner = self.0.clone();
+        let client = self.0.clone();
         future_to_promise(async move {
-            let remote = parse_remote(&remote)?;
-            let head = RequestHead { method: "GET".into(), path, headers: headers_from_js(headers)?, websocket: true };
-            let (send, recv) = inner.open(remote, &head).await.map_err(js_val)?;
-            let mut recv = recv;
-            let resp: ResponseHead = proto::read_head(&mut recv).await.map_err(js_val)?;
+            let (resp, outcome) = client.websocket(&remote, path, headers_from_js(headers)?).await.map_err(js_val)?;
             let out = response_object(&resp)?;
-            if resp.status == 101 {
-                let socket = WebSocketConn { send: Rc::new(Mutex::new(send)), recv: Rc::new(Mutex::new(recv)) };
-                Reflect::set(&out, &"socket".into(), &socket.into())?;
-            } else {
-                Reflect::set(&out, &"body".into(), &body_stream(recv).into())?;
-            }
+            match outcome {
+                WsOutcome::Socket(socket) => Reflect::set(&out, &"socket".into(), &WebSocketConn(socket).into())?,
+                WsOutcome::Rejected(body) => Reflect::set(&out, &"body".into(), &body_stream(body).into())?,
+            };
             Ok(out.into())
         })
     }
 
     /// Close all connections and the local endpoint.
     pub fn close(&self) -> Promise {
-        let inner = self.0.clone();
+        let client = self.0.clone();
         future_to_promise(async move {
-            let slots: Vec<_> = inner.conns.borrow_mut().drain().map(|(_, slot)| slot).collect();
-            for slot in slots {
-                if let Some(conn) = slot.lock().await.take() {
-                    conn.close(0u32.into(), b"bye");
-                }
-            }
-            inner.endpoint.close().await;
+            client.close().await;
             Ok(JsValue::UNDEFINED)
         })
     }
 }
 
-impl Inner {
-    /// Returns the live connection, dialing (again) if there is none or it was lost.
-    async fn connection(&self, remote: EndpointId) -> Result<Connection> {
-        // Each gateway has its own slot, so dialing one doesn't hold up requests to another.
-        let slot = self.conns.borrow_mut().entry(remote).or_default().clone();
-        let mut guard = slot.lock().await;
-        if let Some(conn) = guard.as_ref() {
-            if conn.close_reason().is_none() {
-                return Ok(conn.clone());
-            }
-        }
-        let addr = self
-            .relay_hints
-            .iter()
-            .fold(iroh::EndpointAddr::new(remote), |addr, url| addr.with_relay_url(url.clone()));
-        // Hinting our own relays makes gateways on them fast to reach, but for a gateway on some
-        // other relay (e.g. a standby on n0's) the handshake first goes nowhere, and QUIC's
-        // retransmit backoff can then stretch the dial past 15 s. So if the hinted dial hasn't
-        // finished after a moment, also dial with address lookup alone and take whichever wins.
-        let mut hinted = std::pin::pin!(self.endpoint.connect(addr, ALPN));
-        let mut plain = std::pin::pin!(async {
-            n0_future::time::sleep(Duration::from_millis(1500)).await;
-            self.endpoint.connect(iroh::EndpointAddr::new(remote), ALPN).await
-        });
-        let first = n0_future::future::race(async { (true, hinted.as_mut().await) }, async { (false, plain.as_mut().await) }).await;
-        let conn = match first {
-            (_, Ok(conn)) => Ok(conn),
-            (true, Err(_)) => plain.await,
-            (false, Err(_)) => hinted.await,
-        }
-        .context("connecting to gateway")?;
-        *guard = Some(conn.clone());
-        Ok(conn)
+fn body_from_js(body: JsValue) -> Result<Body, JsValue> {
+    if body.is_undefined() || body.is_null() {
+        return Ok(Body::Bytes(Vec::new()));
     }
-
-    /// Opens a fresh stream and sends the request head, retrying once on a stale connection.
-    async fn open(&self, remote: EndpointId, head: &RequestHead) -> Result<(SendStream, RecvStream)> {
-        let conn = self.connection(remote).await?;
-        let (mut send, recv) = match conn.open_bi().await {
-            Ok(streams) => streams,
-            Err(_) => {
-                let slot = self.conns.borrow().get(&remote).cloned();
-                if let Some(slot) = slot {
-                    *slot.lock().await = None;
-                }
-                self.connection(remote).await?.open_bi().await?
-            }
-        };
-        proto::write_head(&mut send, head).await?;
-        Ok((send, recv))
+    if let Some(bytes) = body.dyn_ref::<Uint8Array>() {
+        return Ok(Body::Bytes(bytes.to_vec()));
     }
-
-    async fn start(&self, remote: EndpointId, head: &RequestHead, body: RequestBody) -> Result<(ResponseHead, RecvStream)> {
-        let (send, mut recv) = self.open(remote, head).await?;
-        // Upload while waiting for the response so the backend may answer (or stream back)
-        // before the request body is complete.
-        let upload_error = Rc::new(std::cell::RefCell::new(None::<String>));
-        wasm_bindgen_futures::spawn_local({
-            let upload_error = upload_error.clone();
-            async move {
-                if let Err(err) = body.upload(send).await {
-                    *upload_error.borrow_mut() = Some(format!("{err:#}"));
-                }
-            }
-        });
-        match proto::read_head::<ResponseHead>(&mut recv).await {
-            Ok(resp) => Ok((resp, recv)),
-            Err(err) => match upload_error.borrow_mut().take() {
-                Some(upload) => Err(anyhow::anyhow!("uploading request body failed: {upload}")),
-                None => Err(err),
-            },
-        }
-    }
-}
-
-enum RequestBody {
-    Bytes(Vec<u8>),
-    Stream(wasm_streams::ReadableStream),
-}
-
-impl RequestBody {
-    fn from_js(body: JsValue) -> Result<Self, JsValue> {
-        if body.is_undefined() || body.is_null() {
-            return Ok(Self::Bytes(Vec::new()));
-        }
-        if let Some(bytes) = body.dyn_ref::<Uint8Array>() {
-            return Ok(Self::Bytes(bytes.to_vec()));
-        }
-        match body.dyn_into::<wasm_streams::readable::sys::ReadableStream>() {
-            Ok(stream) => Ok(Self::Stream(wasm_streams::ReadableStream::from_raw(stream))),
-            Err(_) => Err(JsError::new("body must be a Uint8Array or a ReadableStream<Uint8Array>").into()),
-        }
-    }
-
-    async fn upload(self, mut send: SendStream) -> Result<()> {
-        let res = async {
-            match self {
-                Self::Bytes(bytes) => send.write_all(&bytes).await?,
-                Self::Stream(stream) => {
-                    let mut chunks = stream.into_stream();
-                    while let Some(chunk) = chunks.next().await {
-                        let chunk = chunk.map_err(|e| anyhow::anyhow!("body stream errored: {e:?}"))?;
-                        let chunk = chunk
-                            .dyn_into::<Uint8Array>()
-                            .map_err(|_| anyhow::anyhow!("body stream chunks must be Uint8Array"))?;
-                        send.write_all(&chunk.to_vec()).await?;
-                    }
-                }
-            }
-            anyhow::Ok(())
-        }
-        .await;
-        match res {
-            Ok(()) => send.finish()?,
-            // Abort the stream so the gateway doesn't forward a truncated body as complete.
-            Err(_) => {
-                let _ = send.reset(1u32.into());
-            }
-        }
-        res
-    }
+    let stream = body
+        .dyn_into::<wasm_streams::readable::sys::ReadableStream>()
+        .map_err(|_| JsError::new("body must be a Uint8Array or a ReadableStream<Uint8Array>"))?;
+    let chunks = wasm_streams::ReadableStream::from_raw(stream).into_stream().map(|chunk| {
+        let chunk = chunk.map_err(|e| anyhow::anyhow!("body stream errored: {e:?}"))?;
+        let chunk = chunk
+            .dyn_into::<Uint8Array>()
+            .map_err(|_| anyhow::anyhow!("body stream chunks must be Uint8Array"))?;
+        Ok(chunk.to_vec())
+    });
+    Ok(Body::Stream(Box::pin(chunks)))
 }
 
 /// One WebSocket tunnelled over an iroh stream. Driven by the JS `IrohWebSocket` wrapper.
 #[wasm_bindgen]
-pub struct WebSocketConn {
-    send: Rc<Mutex<SendStream>>,
-    recv: Rc<Mutex<RecvStream>>,
-}
+pub struct WebSocketConn(client_core::WebSocket);
 
 #[wasm_bindgen]
 impl WebSocketConn {
     /// Resolves to the next message: `{ type: "text", data: string }`,
     /// `{ type: "binary", data: Uint8Array }`, `{ type: "close", code, reason }`, or `null` at the end.
     pub fn recv(&self) -> Promise {
-        let recv = self.recv.clone();
+        let socket = self.0.clone();
         future_to_promise(async move {
-            let frame = proto::read_frame(&mut *recv.lock().await).await.map_err(js_val)?;
+            let frame = socket.recv().await.map_err(js_val)?;
             let Some(frame) = frame else { return Ok(JsValue::NULL) };
             let out = Object::new();
             match frame {
@@ -355,13 +197,9 @@ impl WebSocketConn {
     }
 
     fn send_frame(&self, frame: WsFrame, finish: bool) -> Promise {
-        let send = self.send.clone();
+        let socket = self.0.clone();
         future_to_promise(async move {
-            let mut send = send.lock().await;
-            proto::write_frame(&mut send, &frame).await.map_err(js_val)?;
-            if finish {
-                send.finish().map_err(|e| js_val(e.into()))?;
-            }
+            socket.send(frame, finish).await.map_err(js_val)?;
             Ok(JsValue::UNDEFINED)
         })
     }
@@ -381,32 +219,18 @@ fn response_object(resp: &ResponseHead) -> Result<Object, JsValue> {
     Ok(out)
 }
 
-/// Exposes the rest of a QUIC stream as a JS `ReadableStream<Uint8Array>`.
-/// Cancelling the JS stream drops the `RecvStream`, which tells the gateway to stop sending.
-fn body_stream(recv: RecvStream) -> wasm_streams::readable::sys::ReadableStream {
-    let chunks = n0_future::stream::unfold(Some(recv), |recv| async move {
-        let mut recv = recv?;
-        match recv.read_chunk(CHUNK_SIZE).await {
-            Ok(Some(bytes)) => Some((Ok(JsValue::from(Uint8Array::from(&bytes[..]))), Some(recv))),
+/// Exposes the rest of a response as a JS `ReadableStream<Uint8Array>`.
+/// Cancelling the JS stream drops the body, which tells the gateway to stop sending.
+fn body_stream(body: ResponseBody) -> wasm_streams::readable::sys::ReadableStream {
+    let chunks = n0_future::stream::unfold(Some(body), |body| async move {
+        let mut body = body?;
+        match body.next_chunk().await {
+            Ok(Some(bytes)) => Some((Ok(JsValue::from(Uint8Array::from(&bytes[..]))), Some(body))),
             Ok(None) => None,
             Err(err) => Some((Err(JsValue::from(JsError::new(&err.to_string()))), None)),
         }
     });
     wasm_streams::ReadableStream::from_stream(chunks.boxed_local()).into_raw()
-}
-
-fn parse_secret_key(hex: &str) -> Result<iroh::SecretKey> {
-    let hex = hex.trim();
-    anyhow::ensure!(hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()), "secret key must be 64 hex characters");
-    let mut bytes = [0u8; 32];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)?;
-    }
-    Ok(iroh::SecretKey::from_bytes(&bytes))
-}
-
-fn parse_remote(remote: &str) -> Result<EndpointId, JsValue> {
-    remote.trim().parse().map_err(|e| JsError::new(&format!("invalid endpoint id {remote:?}: {e}")).into())
 }
 
 fn js(err: impl Into<anyhow::Error>) -> JsError {

@@ -4,6 +4,7 @@
 //   IROH_ENDPOINT_ID_B  gateway B  -> backend B
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
+import { resolveObjectURL } from "node:buffer";
 import { generateKeyPairSync } from "node:crypto";
 import { createIrohFetch } from "iroh-fetch";
 
@@ -121,4 +122,15 @@ test("single-backend shorthand accepts endpointIds", opts, async () => {
   const iroh = await create({ connectTimeout: 30_000, endpointIds: [deadId(), A2] });
   const res = await iroh.fetch("/hello");
   assert.equal(res.headers.get("x-iroh-gateway-id"), A2);
+});
+
+test("objectUrl() returns a blob: URL of the body and rejects on errors", opts, async () => {
+  const iroh = await create({ backends: { "https://api.demo": A1, "https://files.demo": B } });
+  const url = await iroh.objectUrl("https://files.demo/image.svg");
+  assert.match(url, /^blob:/);
+  const blob = resolveObjectURL(url);
+  assert.match(blob.type, /^image\/svg\+xml/);
+  assert.match(await blob.text(), /<svg/);
+  URL.revokeObjectURL(url);
+  await assert.rejects(iroh.objectUrl("https://api.demo/auth/me"), /-> 401/);
 });

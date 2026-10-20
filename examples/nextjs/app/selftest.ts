@@ -227,6 +227,36 @@ export const checks: Check[] = [
       }),
   },
   {
+    name: "<img> via iroh.objectUrl (no service worker needed)",
+    run: async ({ client }) => {
+      const url = await client.objectUrl(`${FILES}/image.svg?t=${Date.now()}`);
+      try {
+        return await new Promise<string>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => (img.naturalWidth === 96 ? resolve(`${img.naturalWidth}×${img.naturalHeight} from ${url.slice(0, 5)}`) : reject(new Error(`${img.naturalWidth}`)));
+          img.onerror = () => reject(new Error("image failed to load"));
+          img.src = url;
+        });
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    },
+  },
+  {
+    name: "<IrohImage> on the page loaded (service worker or blob: fallback)",
+    run: async () => {
+      // Rendered by page.tsx; it uses the service worker where one controls the page, else a blob: URL.
+      const img = document.querySelector<HTMLImageElement>("[data-testid=iroh-image]");
+      assert(img, "no <IrohImage> on the page");
+      for (let i = 0; i < 40 && !(img.complete && img.naturalWidth); i++) await new Promise((r) => setTimeout(r, 250));
+      assert(img.naturalWidth === 96, `not loaded (src ${img.currentSrc.slice(0, 40) || "unset"})`);
+      const sw = Boolean(navigator.serviceWorker?.controller);
+      const via = img.currentSrc.startsWith("blob:") ? "blob: URL" : "service worker";
+      assert(sw === (via === "service worker"), `${via} used although service worker is ${sw ? "on" : "off"}`);
+      return via;
+    },
+  },
+  {
     name: "Download link via proxyUrl (service worker)",
     needsServiceWorker: true,
     run: async ({ client }) => {

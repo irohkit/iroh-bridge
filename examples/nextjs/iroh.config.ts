@@ -24,7 +24,11 @@ export const backends: IrohFetchOptions["backends"] = process.env.NEXT_PUBLIC_IR
   ? JSON.parse(process.env.NEXT_PUBLIC_IROH_BACKENDS)
   : demoBackends;
 
-export const relayUrl = process.env.NEXT_PUBLIC_IROH_RELAY_URL || undefined;
+// The demo gateways use this self-hosted relay. It only admits clients with a token; this one is
+// for the public demo page, so it is not a secret (anyone can read it from the page). It only
+// limits who can use the relay's bandwidth; the backends authenticate users themselves (JWT).
+export const relayUrl = process.env.NEXT_PUBLIC_IROH_RELAY_URL || "https://relay.119-10-142-208.sslip.io";
+export const relayToken = process.env.NEXT_PUBLIC_IROH_RELAY_TOKEN || "web_50c3173cc8739abf636406fcd9db4c3a";
 
 export const API = "https://api.demo";
 export const FILES = "https://files.demo";

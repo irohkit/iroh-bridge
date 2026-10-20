@@ -18,9 +18,13 @@ import sys
 
 from playwright.async_api import async_playwright
 
-args = [a for a in sys.argv[1:] if not a.startswith("--")]
-URL = args[0] if args else "https://iroh-bridge.vercel.app/"
-ONLY = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None
+argv = sys.argv[1:]
+ONLY = None
+if "--only" in argv:
+    i = argv.index("--only")
+    ONLY = argv[i + 1]
+    del argv[i : i + 2]
+URL = argv[0] if argv else "https://iroh-bridge.vercel.app/"
 STATUS = "document.querySelector('[data-testid=status]')?.textContent ?? ''"
 SUMMARY = "document.querySelector('[data-testid=selftest-summary]')?.textContent ?? ''"
 DONE = re.compile(r"^(\d+)/(\d+) passed( \((\d+) skipped\))?$")
@@ -64,7 +68,7 @@ async def run(name, browser_type, launch, context_opts, expect_sw):
     page = await context.new_page()
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
-    await page.goto(URL, wait_until="networkidle")
+    await page.goto(URL, wait_until="load", timeout=60_000)
     await page.wait_for_function(f"/^(Connected|Error)/.test({STATUS})", timeout=60_000)
     result = {"browser": name, "version": browser.version, "status": (await page.evaluate(STATUS))[:60]}
     if result["status"].startswith("Connected"):

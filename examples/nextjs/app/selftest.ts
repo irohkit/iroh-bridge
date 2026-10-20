@@ -121,9 +121,9 @@ export const checks: Check[] = [
     name: "HA: a standby gateway is connected for every backend",
     run: async ({ client }) => {
       // Each backend has a primary (own relay) and a standby (public relays) for failover. The
-      // standby connects in the background, which can take a second or two over the public relays.
+      // standby connects in the background, which over the public relays usually takes a second or two but sometimes over ten.
       const allUp = () => client.backends.every((b) => b.replicas.every((r) => r.connected));
-      for (let i = 0; i < 40 && !allUp(); i++) await new Promise((r) => setTimeout(r, 250));
+      for (let i = 0; i < 80 && !allUp(); i++) await new Promise((r) => setTimeout(r, 250));
       const summary = client.backends.map((b) => {
         const up = b.replicas.filter((r) => r.connected).length;
         assert(up === b.replicas.length, `${b.origin}: ${up}/${b.replicas.length} replicas connected`);

@@ -68,6 +68,9 @@ async def run(name, browser_type, launch, context_opts, expect_sw):
     page = await context.new_page()
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
+    console = []
+    page.on("console", lambda m: m.type in ("error", "warning") and console.append(f"{m.type}: {m.text}"))
+    page.on("requestfailed", lambda r: console.append(f"request failed: {r.url[:120]} ({r.failure})"))
     await page.goto(URL, wait_until="load", timeout=60_000)
     await page.wait_for_function(f"/^(Connected|Error)/.test({STATUS})", timeout=60_000)
     result = {"browser": name, "version": browser.version, "status": (await page.evaluate(STATUS))[:60]}
@@ -84,6 +87,8 @@ async def run(name, browser_type, launch, context_opts, expect_sw):
     else:
         result["ok"] = False
     result["page_errors"] = errors[:5]
+    if not result["ok"]:
+        result["console"] = console[-15:]
     await browser.close()
     return result
 

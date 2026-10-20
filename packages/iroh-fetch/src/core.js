@@ -56,20 +56,42 @@ export function makeCreate(init) {
     }
 
     const storage = persistCookies ? (persistCookies === true ? globalThis.localStorage : persistCookies) : undefined;
+    let closed = false;
+    const timers = new Set();
     for (const b of backends) {
       // One jar per backend, shared by its replicas, so a session survives a failover.
       b.jar = cookies ? new CookieJar(storage && { storage, key: `iroh-fetch:cookies:${b.origin ?? b.replicas[0].endpointId}` }) : null;
       b.cooldown = cooldown;
       for (const r of b.replicas) {
         let pending = null;
+        let retryDelay = 0;
+        let retryTimer = null;
         r.reset = () => (pending = null);
         // Dials once and shares the result; a failure is forgotten so a later request retries.
         r.ensureConnected = () =>
-          (pending ??= connectWithTimeout(client, r, connectTimeout).catch((err) => {
-            pending = null;
-            r.downUntil = Date.now() + cooldown;
-            throw err;
-          }));
+          (pending ??= connectWithTimeout(client, r, connectTimeout).then(
+            () => {
+              retryDelay = 0;
+            },
+            (err) => {
+              pending = null;
+              r.downUntil = Date.now() + cooldown;
+              // Keep retrying in the background, so a standby that missed its first dial is warm
+              // before it's needed instead of waiting for a request to wake it up.
+              // Back off (up to 5 min) so a replica that's gone for good costs little.
+              if (!closed && !retryTimer && b.replicas.length > 1) {
+                retryDelay = Math.min(retryDelay ? retryDelay * 2 : cooldown, 300_000);
+                retryTimer = setTimeout(() => {
+                  timers.delete(retryTimer);
+                  retryTimer = null;
+                  if (!closed && !r.connected) r.ensureConnected().catch(() => {});
+                }, retryDelay);
+                retryTimer.unref?.();
+                timers.add(retryTimer);
+              }
+              throw err;
+            },
+          ));
       }
     }
 
@@ -80,6 +102,8 @@ export function makeCreate(init) {
       // requests to the unreachable one fail (and retry) on their own.
       const failed = results.filter((r) => r.status === "rejected");
       if (failed.length === backends.length) {
+        closed = true;
+        for (const t of timers) clearTimeout(t);
         client.close().catch(() => {});
         const reason = failed[0].reason;
         throw reason instanceof AggregateError ? reason.errors[0] : reason;
@@ -180,7 +204,11 @@ export function makeCreate(init) {
       endpointId: client.endpointId(),
       /** This client's secret key (hex), to give it the same endpoint id next time. Keep it secret. */
       exportSecretKey: () => client.secretKey(),
-      close: () => client.close(),
+      close: () => {
+        closed = true;
+        for (const t of timers) clearTimeout(t);
+        return client.close();
+      },
     };
   };
 }

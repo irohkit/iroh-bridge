@@ -106,7 +106,8 @@ test("HA failover also works for WebSocket", opts, async () => {
 });
 
 test("HA round-robin spreads requests over healthy replicas", opts, async () => {
-  const iroh = await create({ backends: { "https://api.demo": { endpointIds: [A1, A2], strategy: "round-robin" } } });
+  // A2 sits on n0's public relays, where a first dial now and then takes over 10 s.
+  const iroh = await create({ connectTimeout: 30_000, backends: { "https://api.demo": { endpointIds: [A1, A2], strategy: "round-robin" } } });
   const seen = new Set();
   for (let i = 0; i < 6; i++) {
     const res = await iroh.fetch("https://api.demo/hello");
@@ -117,7 +118,7 @@ test("HA round-robin spreads requests over healthy replicas", opts, async () => 
 });
 
 test("single-backend shorthand accepts endpointIds", opts, async () => {
-  const iroh = await create({ endpointIds: [deadId(), A2] });
+  const iroh = await create({ connectTimeout: 30_000, endpointIds: [deadId(), A2] });
   const res = await iroh.fetch("/hello");
   assert.equal(res.headers.get("x-iroh-gateway-id"), A2);
 });

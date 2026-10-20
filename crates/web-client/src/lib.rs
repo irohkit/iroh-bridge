@@ -195,7 +195,22 @@ impl Inner {
             .relay_hints
             .iter()
             .fold(iroh::EndpointAddr::new(remote), |addr, url| addr.with_relay_url(url.clone()));
-        let conn = self.endpoint.connect(addr, ALPN).await.context("connecting to gateway")?;
+        // Hinting our own relays makes gateways on them fast to reach, but for a gateway on some
+        // other relay (e.g. a standby on n0's) the handshake first goes nowhere, and QUIC's
+        // retransmit backoff can then stretch the dial past 15 s. So if the hinted dial hasn't
+        // finished after a moment, also dial with address lookup alone and take whichever wins.
+        let mut hinted = std::pin::pin!(self.endpoint.connect(addr, ALPN));
+        let mut plain = std::pin::pin!(async {
+            n0_future::time::sleep(Duration::from_millis(1500)).await;
+            self.endpoint.connect(iroh::EndpointAddr::new(remote), ALPN).await
+        });
+        let first = n0_future::future::race(async { (true, hinted.as_mut().await) }, async { (false, plain.as_mut().await) }).await;
+        let conn = match first {
+            (_, Ok(conn)) => Ok(conn),
+            (true, Err(_)) => plain.await,
+            (false, Err(_)) => hinted.await,
+        }
+        .context("connecting to gateway")?;
         *guard = Some(conn.clone());
         Ok(conn)
     }

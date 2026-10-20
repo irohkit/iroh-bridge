@@ -738,7 +738,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbg_new_with_str_and_init_4618dee4e950224f: function() { return handleError(function (arg0, arg1, arg2) {
-            const ret = new Request(getStringFromWasm0(arg0, arg1), arg2);
+            const ret = new Request(irohRelayUrl(getStringFromWasm0(arg0, arg1)), arg2);
             return ret;
         }, arguments); },
         __wbg_new_with_str_sequence_f79e461d58fdeacc: function() { return handleError(function (arg0, arg1, arg2) {

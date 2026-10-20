@@ -30,7 +30,7 @@ use tokio_tungstenite::tungstenite::{
     Message,
 };
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const CHUNK_SIZE: usize = 64 * 1024;
 /// How much request data one connection may have in flight across all its streams. QUIC's
@@ -137,7 +137,14 @@ fn limit_secs(secs: u64) -> Option<Duration> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Logs go through a background thread: if whatever reads stdout stalls (journald waiting on a
+    // busy disk, a full `docker logs` pipe, a paused terminal), lines are dropped instead of
+    // blocking the runtime, which would freeze every connection.
+    let (log_writer, _log_guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .finish(std::io::stdout());
     tracing_subscriber::fmt()
+        .with_writer(log_writer)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "iroh_gateway=info".into()),
@@ -261,6 +268,11 @@ async fn main() -> Result<()> {
                     let _permit = permit;
                     match incoming.await {
                         Ok(conn) => handle_connection(ctx, conn).await,
+                        // Clients that dial twice and keep the faster connection close the other
+                        // one mid-handshake; that's routine, not worth a warning.
+                        Err(err) if format!("{err:#}").contains("aborted by peer") => {
+                            debug!("incoming connection closed by the client during the handshake: {err:#}")
+                        }
                         Err(err) => warn!("incoming connection failed: {err:#}"),
                     }
                 });

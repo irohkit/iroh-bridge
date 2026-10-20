@@ -386,7 +386,7 @@ needs outbound UDP/HTTPS, and no inbound port.
 | `IROH_RELAY_TOKEN` / `--relay-token` | | token for a relay that requires one |
 | `MAX_BODY_BYTES` / `--max-body` | 32 MiB | request body limit |
 | `UPSTREAM_COOLDOWN_SECS` | `10` | how long an unreachable upstream is skipped |
-| `RUST_LOG` | `iroh_gateway=info` | log level |
+| `RUST_LOG` | `iroh_gateway=info` | log level. Logs go to stdout through a buffer: if the log reader stalls, lines are dropped instead of blocking requests |
 | `IROH_ADMIN_ADDR` / `--admin-addr` | off | local admin port for health and metrics ([Monitoring](#monitoring)) |
 
 Limits and timeouts, all with flags of the same name (`--max-head`, `--head-timeout-secs`, ...). The defaults are generous
@@ -521,8 +521,11 @@ Leave both unset to stay on the public relays.
   | Mobile (emulated) | iPhone 15 and iPad Pro 11 (Safari), Pixel 7 (Chrome), Galaxy (Samsung Internet), Facebook in-app on Android |
   | No service worker | LINE in-app on iPhone, Firefox with service workers blocked: 15/15, the 2 service-worker checks skipped |
 
-  Three browser-specific bugs were found and fixed this way: Firefox has no `Request.body` stream, WebKit refuses relay
-  hostnames ending in a dot, and apps never became ready where service workers can't take control.
+  Browser-specific bugs found and fixed this way: Firefox has no `Request.body` stream; WebKit rejects relay hostnames
+  ending in a dot, for WebSockets and for the relay latency probes; and apps never became ready where service workers
+  can't take control. Running the matrix repeatedly also showed that a standby gateway on another relay sometimes took
+  15 s+ to dial. Clients now add a plain address-lookup dial after 1.5 s, and replicas that failed keep retrying in the
+  background with backoff, so standbys are connected before they're needed.
 - **Load** ([`scripts/loadtest.mjs`](scripts/loadtest.mjs), relay on a 2-core VPS): 0 errors at 1,000 req/s from 100
   clients, 100 concurrent WebSockets and 50 clients of mixed traffic, with ~13 ms latency throughout. The gateways used
   ~15% of a core at 500 req/s each; the relay's TLS front end (Caddy) is what saturates first (~58% CPU at 1,000 req/s).

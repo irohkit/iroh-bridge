@@ -1,6 +1,6 @@
 {
   "name": "iroh-fetch",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "fetch() over iroh: reach an HTTP backend behind any NAT from browsers and Node.js",
   "license": "MIT",
   "author": "poommin2543",

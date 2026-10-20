@@ -77,18 +77,30 @@ jobs:
           rm -rf native
 
       # The platform packages go first, so iroh-fetch never points at versions that don't exist.
-      # Already published versions are skipped, so a failed run can simply be re-run.
+      # Already published versions are skipped, so a failed run can simply be re-run. A platform
+      # package that can't be published (e.g. trusted publishing not set up for its name yet) is
+      # dropped from iroh-fetch's optionalDependencies: that platform then uses the WASM client
+      # instead of blocking the release.
       - name: Publish the prebuild packages
         run: |
+          missing=""
           for dir in npm-native/*/; do
             name=$(node -p "require('./$dir/package.json').name")
             version=$(node -p "require('./$dir/package.json').version")
             if npm view "$name@$version" version >/dev/null 2>&1; then
               echo "$name@$version is already published"
+            elif (cd "$dir" && npm publish --access public --provenance); then
+              echo "published $name@$version"
             else
-              (cd "$dir" && npm publish --access public --provenance)
+              echo "::warning::could not publish $name@$version; that platform falls back to WASM"
+              missing="$missing $name"
             fi
           done
+          MISSING="$missing" node -e '
+            const fs = require("fs"), p = "packages/iroh-fetch/package.json", pkg = JSON.parse(fs.readFileSync(p));
+            for (const name of process.env.MISSING.split(" ").filter(Boolean)) delete pkg.optionalDependencies?.[name];
+            fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
+            console.log("optionalDependencies:", JSON.stringify(pkg.optionalDependencies ?? {}));'
 
       - name: Publish iroh-fetch
         working-directory: packages/iroh-fetch

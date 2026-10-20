@@ -6,6 +6,14 @@ name: native-prebuilds
 on:
   workflow_call:
   workflow_dispatch:
+  # Also on pull requests that touch the Rust client, so every platform is known to build before
+  # a release needs it.
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/native-prebuilds.yml"
 
 permissions:
   contents: read

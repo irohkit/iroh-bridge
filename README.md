@@ -190,6 +190,12 @@ back. Browsers don't let a service worker catch navigations to other origins, so
 links use `iroh.proxyUrl(url)`, which gives a same-origin `/__iroh__/<host>/...` URL the worker routes. Service workers
 need HTTPS (or localhost).
 
+Some browsers have no usable service worker: in-app browsers on iOS (LINE, Facebook, Instagram) and some private
+modes. There `serviceWorker()` stops waiting for control after 5 s and returns `controlled: false`, and
+`<IrohProvider serviceWorker>` logs a warning and carries on. `fetch`, XHR, `WebSocket` and `EventSource` keep
+working; only browser-initiated loads (`<img>`, `<video>`, CSS, downloads) of backend URLs don't. Where that matters,
+load the bytes with `fetch` and show them through `URL.createObjectURL(await res.blob())`.
+
 ### Stable client identity
 
 Each client gets a random endpoint id per session, which the backend sees as `X-Iroh-Remote-Id`. To recognise a device
@@ -506,9 +512,17 @@ Leave both unset to stay on the public relays.
 
 ## Tested
 
-- **Browsers:** the demo's 17-check self-test passes in Chromium, Firefox 157, WebKit 27 (Safari's engine) and an
-  emulated iPhone ([`scripts/browser-test.py`](scripts/browser-test.py)). Two browser-specific bugs were found and fixed
-  this way: Firefox has no `Request.body` stream, and WebKit refuses relay hostnames ending in a dot.
+- **Browsers:** the demo's 17-check self-test passes in all of these ([`scripts/browser-test.py`](scripts/browser-test.py),
+  Playwright):
+
+  | | |
+  |---|---|
+  | Desktop | Google Chrome 155, Microsoft Edge 155, Chromium 156 (the engine of Brave, Opera, Vivaldi), Firefox 157, WebKit 27 (Safari's engine) |
+  | Mobile (emulated) | iPhone 15 and iPad Pro 11 (Safari), Pixel 7 (Chrome), Galaxy (Samsung Internet), Facebook in-app on Android |
+  | No service worker | LINE in-app on iPhone, Firefox with service workers blocked: 15/15, the 2 service-worker checks skipped |
+
+  Three browser-specific bugs were found and fixed this way: Firefox has no `Request.body` stream, WebKit refuses relay
+  hostnames ending in a dot, and apps never became ready where service workers can't take control.
 - **Load** ([`scripts/loadtest.mjs`](scripts/loadtest.mjs), relay on a 2-core VPS): 0 errors at 1,000 req/s from 100
   clients, 100 concurrent WebSockets and 50 clients of mixed traffic, with ~13 ms latency throughout. The gateways used
   ~15% of a core at 500 req/s each; the relay's TLS front end (Caddy) is what saturates first (~58% CPU at 1,000 req/s).

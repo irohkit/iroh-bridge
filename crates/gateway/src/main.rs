@@ -52,7 +52,7 @@ const WS_HANDSHAKE_HEADERS: &[&str] = &[
 ];
 
 #[derive(Parser, Debug, Clone)]
-#[command(about = "Expose a local HTTP backend over iroh")]
+#[command(version, about = "Expose a local HTTP backend over iroh")]
 struct Args {
     /// Base URL of the HTTP backend to forward requests to. Several comma-separated URLs are
     /// load-balanced round-robin, skipping any that recently failed to accept a connection.

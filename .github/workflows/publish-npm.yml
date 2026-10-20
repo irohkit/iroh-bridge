@@ -19,6 +19,9 @@ jobs:
         run: |
           version=$(node -p "require('./packages/iroh-fetch/package.json').version")
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != package version $version"; exit 1; }
+          # iroh-gateway reports its crate version (/status, --version); keep it in step with the tag.
+          gateway=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/gateway/Cargo.toml | head -1)
+          test "v$gateway" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != iroh-gateway version $gateway"; exit 1; }
 
   # The native addon for each platform; published below as iroh-fetch-<platform> packages.
   prebuilds:

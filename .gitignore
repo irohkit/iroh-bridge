@@ -4,3 +4,4 @@ node_modules
 *.key
 .env*.local
 *.tsbuildinfo
+.venv/

@@ -25,6 +25,9 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
 - [Frontend: `iroh-fetch`](#frontend-iroh-fetch)
   - [Use the normal fetch, EventSource and WebSocket (`install`)](#use-the-normal-fetch-eventsource-and-websocket-install)
   - [React / Next.js](#react--nextjs)
+  - [XMLHttpRequest and axios](#xmlhttprequest-and-axios)
+  - [Images, video and downloads (service worker)](#images-video-and-downloads-service-worker)
+  - [Stable client identity](#stable-client-identity)
   - [Several backends](#several-backends)
   - [High availability](#high-availability)
   - [fetch behaviour](#fetch-behaviour)
@@ -39,6 +42,7 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
   - [Several upstreams, routing by host and path](#several-upstreams-routing-by-host-and-path)
   - [Access control](#access-control)
   - [What your backend sees](#what-your-backend-sees)
+  - [Monitoring](#monitoring)
 - [Local port: `iroh-proxy`](#local-port-iroh-proxy)
 - [Run your own relay](#run-your-own-relay)
 - [Production notes](#production-notes)
@@ -49,7 +53,8 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
 
 | | |
 |---|---|
-| **Works like a public URL** | `install()` routes the global `fetch`, `EventSource` and `WebSocket` for chosen origins, so existing code, SWR, React Query, axios (fetch adapter) and friends work unchanged |
+| **Works like a public URL** | `install()` routes the global `fetch`, `XMLHttpRequest`, `EventSource` and `WebSocket` for chosen origins, so existing code, axios, SWR, React Query, jQuery and friends work unchanged |
+| **Images, video, downloads** | an optional service worker makes `<img>`, `<video>`, CSS `url()`, fonts and downloads of backend URLs work too |
 | **Full fetch semantics** | absolute or relative URLs, all methods and headers, `res.url` / `res.redirected`, redirects (`follow` / `manual` / `error`), cookies (`credentials`), `AbortSignal` (incl. `AbortSignal.timeout`) |
 | **Streaming both ways** | responses stream (SSE, NDJSON, downloads); uploads of `File`, `Blob`, `FormData` or `ReadableStream` stream without buffering |
 | **WebSocket** | standard API, text and binary, subprotocols, clean close codes, plus custom handshake headers (e.g. `Authorization`) |
@@ -61,6 +66,8 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
 | **Access control** | allow-list client endpoint ids and paths at the gateway |
 | **Hardened** | strict path and header validation, limits and timeouts against slow or flooding clients, no error leaks, sandboxed service; checked by attacking test gateways |
 | **Trustworthy caller identity** | the backend gets `X-Iroh-Remote-Id`, the caller's cryptographically verified endpoint id |
+| **Stable client identity** | optional fixed endpoint id per device or server (`persistIdentity`, `secretKey`) for allow-lists and rate limits |
+| **Monitoring** | gateway `/healthz`, `/readyz`, `/status` and Prometheus `/metrics` on a local admin port |
 | **React bindings** | `iroh-fetch/react`: `<IrohProvider>`, `useIroh()`, `useIrohFetch()` |
 | **Runs anywhere** | browsers and Node.js ≥ 22; gateway binaries for Linux x86_64/arm64 and macOS, a Docker image, and a systemd unit |
 | **Local port** | `iroh-proxy` exposes a gateway as `http://127.0.0.1:PORT` for curl, Postman or any HTTP client |
@@ -144,6 +151,56 @@ The WASM only loads in the browser (inside an effect), so server rendering is un
 [`examples/nextjs`](examples/nextjs): [`iroh.config.ts`](examples/nextjs/iroh.config.ts) maps origins to gateways, and
 the page uses only the standard APIs. Endpoint ids are public addresses, so they can live in the repo. You can also
 override them with `NEXT_PUBLIC_IROH_BACKENDS` (JSON, same shape).
+
+### XMLHttpRequest and axios
+
+`install()` also replaces the global `XMLHttpRequest` (turn it off with `xhr: false`), so code that uses XHR, including
+**axios with its default browser adapter**, jQuery and upload widgets, needs no changes. Upload and download progress
+events work:
+
+```ts
+iroh.install();
+const res = await axios.post("https://api.example.com/files", file, {
+  onUploadProgress: (e) => setProgress(e.loaded / e.total),
+});
+```
+
+The URL is only known at `open()`, so the installed class decides there: matching URLs go over iroh, everything else uses
+the browser's own XHR. Without `install`, use `new iroh.XMLHttpRequest()`. Synchronous XHR isn't supported.
+
+### Images, video and downloads (service worker)
+
+The browser loads `<img src>`, `<video>`, `<audio>`, CSS `url()` and fonts by itself, without going through `fetch`. To
+make those work for backend URLs, register the service worker that ships with the package:
+
+1. Serve `node_modules/iroh-fetch/src/sw.js` from your site's origin, e.g. copy it to `public/iroh-sw.js` in a
+   `prebuild` script (the Next.js example does this).
+2. Register it after connecting: `await iroh.serviceWorker()` (or `<IrohProvider serviceWorker>`). It resolves once
+   the worker controls the page.
+
+```tsx
+<img src="https://api.example.com/avatars/42.png" />          {/* just works */}
+<video src="https://files.example.com/intro.mp4" controls />   {/* Range requests pass through */}
+<a href={iroh.proxyUrl("https://api.example.com/report.pdf")} download>Download</a>
+```
+
+The worker hands each request to an open page of your app, which sends it with iroh-fetch and streams the response
+back. Browsers don't let a service worker catch navigations to other origins, so for downloads and "open in new tab"
+links use `iroh.proxyUrl(url)`, which gives a same-origin `/__iroh__/<host>/...` URL the worker routes. Service workers
+need HTTPS (or localhost).
+
+### Stable client identity
+
+Each client gets a random endpoint id per session, which the backend sees as `X-Iroh-Remote-Id`. To recognise a device
+or server across restarts (for `IROH_ALLOW_CLIENTS`, rate limits or audit logs), give it a fixed one:
+
+```ts
+createIrohFetch({ persistIdentity: true, ... });           // browser: keep it in localStorage
+createIrohFetch({ secretKey: process.env.IROH_CLIENT_KEY }); // server: from a secret (iroh.exportSecretKey())
+```
+
+The secret key is like a password: whoever has it can act as that client. In a browser, page scripts can read
+localStorage, so an XSS bug could steal it; prefer it for servers and trusted apps.
 
 ### Several backends
 
@@ -280,11 +337,13 @@ connects in about a second).
 | `persistCookies` | `false` | `true` (localStorage) or a `Storage` |
 | `relayUrl` | n0 public relays | your own relay ([guide](deploy/relay/README.md)) |
 | `relayToken` | | token for a relay that requires one |
+| `secretKey` | random | fixed client identity (64 hex chars) |
+| `persistIdentity` | `false` | keep the identity in localStorage (`true`) or a `Storage` |
 | `logLevel` | off | `"info"`, `"debug"`, ... iroh logs in the console |
 
-The client object: `fetch`, `EventSource`, `WebSocket`, `websocket(url, { protocols, headers })`, `install(opts)`,
-`backend(origin)`, `backends`, `cookies`, `endpointId` (this client's id, which the backend sees as `X-Iroh-Remote-Id`),
-`close()`.
+The client object: `fetch`, `XMLHttpRequest`, `EventSource`, `WebSocket`, `websocket(url, { protocols, headers })`,
+`install(opts)`, `serviceWorker(opts)`, `proxyUrl(url)`, `backend(origin)`, `backends`, `cookies`, `endpointId` (this
+client's id, which the backend sees as `X-Iroh-Remote-Id`), `exportSecretKey()`, `close()`.
 
 ## Backend: `iroh-gateway`
 
@@ -316,6 +375,7 @@ needs outbound UDP/HTTPS, and no inbound port.
 | `MAX_BODY_BYTES` / `--max-body` | 32 MiB | request body limit |
 | `UPSTREAM_COOLDOWN_SECS` | `10` | how long an unreachable upstream is skipped |
 | `RUST_LOG` | `iroh_gateway=info` | log level |
+| `IROH_ADMIN_ADDR` / `--admin-addr` | off | local admin port for health and metrics ([Monitoring](#monitoring)) |
 
 Limits and timeouts, all with flags of the same name (`--max-head`, `--head-timeout-secs`, ...). The defaults are generous
 for normal use and stop a single client from tying the gateway up:
@@ -355,6 +415,24 @@ IROH_ALLOW_PATHS=/api,/ws                        # everything else gets 403
 Client endpoint ids are random per browser session unless you give the client a fixed key, so the client allow-list is
 mostly useful for server-to-server use (Node, `iroh-proxy`). For browser users, authenticate in your backend as you would
 on a public URL (sessions, tokens). `X-Iroh-Remote-Id` gives you a verified id to rate-limit or audit by.
+
+### Monitoring
+
+Start the gateway with a local admin port:
+
+```bash
+IROH_ADMIN_ADDR=127.0.0.1:9180 iroh-gateway
+```
+
+| Endpoint | |
+|---|---|
+| `GET /healthz` | `200 ok` once the gateway is online on its relay (for systemd/Docker/Kubernetes health checks) |
+| `GET /readyz` | `200` when every route has a healthy upstream, else `503` listing the unhealthy ones |
+| `GET /status` | JSON: endpoint id, version, uptime, relay status, connections, in-flight requests, upstream health |
+| `GET /metrics` | Prometheus: requests by route and status class, WebSocket upgrades, upstream failures and health, rejections by reason, connections, in-flight requests, request duration histogram |
+
+It only binds loopback addresses unless you add `--admin-allow-public` (it has no authentication). Labels never contain
+request paths or queries.
 
 ### Security
 

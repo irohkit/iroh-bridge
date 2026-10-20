@@ -21,6 +21,9 @@ const socket = new WebSocket("wss://files.example.com/ws");
 ```
 
 - Full fetch semantics: redirects, cookies, streaming in both directions, `AbortSignal`
+- `XMLHttpRequest` too (axios's default browser adapter, jQuery, upload progress)
+- Optional service worker for `<img>`, `<video>`, CSS and downloads of backend URLs
+- Optional fixed client identity (`persistIdentity`, `secretKey`)
 - Standard `WebSocket` and `EventSource` (reconnect, `Last-Event-ID`), plus custom headers
 - Many backends from one frontend, and HA replicas with failover or round-robin
 - React: `import { IrohProvider, useIroh, useIrohFetch } from "iroh-fetch/react"`

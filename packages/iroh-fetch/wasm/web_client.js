@@ -1,3 +1,12 @@
+// Added by scripts/build-wasm.sh: WebKit rejects hostnames with a trailing dot.
+function irohRelayUrl(url) {
+    try {
+        const u = new URL(url);
+        if (u.hostname.endsWith('.')) { u.hostname = u.hostname.slice(0, -1); return u.href; }
+    } catch {}
+    return url;
+}
+
 /* @ts-self-types="./web_client.d.ts" */
 
 export class IntoUnderlyingByteSource {
@@ -679,7 +688,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbg_new_4059fb0406225e04: function() { return handleError(function (arg0, arg1) {
-            const ret = new WebSocket(getStringFromWasm0(arg0, arg1));
+            const ret = new WebSocket(irohRelayUrl(getStringFromWasm0(arg0, arg1)));
             return ret;
         }, arguments); },
         __wbg_new_617a8cdb8bb1130e: function() {
@@ -733,7 +742,7 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbg_new_with_str_sequence_f79e461d58fdeacc: function() { return handleError(function (arg0, arg1, arg2) {
-            const ret = new WebSocket(getStringFromWasm0(arg0, arg1), arg2);
+            const ret = new WebSocket(irohRelayUrl(getStringFromWasm0(arg0, arg1)), arg2);
             return ret;
         }, arguments); },
         __wbg_next_33784799010f1bbe: function(arg0) {

@@ -90,8 +90,8 @@ test("HA failover: a dead replica is skipped", opts, async () => {
   }
   assert.ok(Date.now() - started < 10_000, "failover shouldn't wait for the dead replica each time");
   const [api] = iroh.backends;
-  assert.equal(api.replicas[0].healthy, false);
-  assert.equal(api.replicas[1].healthy, true);
+  assert.equal(api.replicas[0].connected, false);
+  assert.equal(api.replicas[1].connected, true);
 });
 
 test("HA failover also works for WebSocket", opts, async () => {

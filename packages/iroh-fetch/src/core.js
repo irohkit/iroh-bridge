@@ -134,6 +134,9 @@ export function makeCreate(init) {
           get healthy() {
             return r.downUntil <= Date.now();
           },
+          get connected() {
+            return r.connected;
+          },
         })),
         get connected() {
           return b.replicas.some((r) => r.downUntil <= Date.now() && r.connected);
@@ -190,7 +193,9 @@ function parseBackends(options) {
  */
 function replicaOrder(b) {
   const now = Date.now();
+  // Replicas with a live connection go first, so a dead or still-dialing one never delays a request.
   let healthy = b.replicas.filter((r) => r.downUntil <= now);
+  healthy = [...healthy.filter((r) => r.connected), ...healthy.filter((r) => !r.connected)];
   if (b.strategy === "round-robin" && healthy.length > 1) {
     const k = b.next++ % healthy.length;
     healthy = [...healthy.slice(k), ...healthy.slice(0, k)];
@@ -232,14 +237,34 @@ function connectWithTimeout(client, r, ms) {
     const problem = client.relayProblem?.();
     return problem ? ` (${problem})` : "";
   };
-  return withTimeout(client.connect(id), ms, () =>
-    new DOMException(
+  // Address lookups and relay connections sometimes fail transiently (a dropped request, a gateway
+  // that just restarted), so keep retrying with backoff until the deadline instead of giving up on
+  // the first error. A relay that refuses us won't change its mind, so that fails right away.
+  let stopped = false;
+  let lastErr = null;
+  const attempt = async () => {
+    for (let delay = 250; ; delay = Math.min(delay * 2, 2000)) {
+      try {
+        return await client.connect(id);
+      } catch (err) {
+        lastErr = err;
+        if (stopped || !ms || /refused this client/.test(client.relayProblem?.() ?? "")) throw err;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        if (stopped) throw err;
+      }
+    }
+  };
+  return withTimeout(attempt(), ms, () => {
+    stopped = true;
+    const last = lastErr ? `; last error: ${lastErr?.message ?? lastErr}` : "";
+    return new DOMException(
       `iroh-fetch: could not reach gateway ${id.slice(0, 10)}… within ${ms} ms ` +
         "(is iroh-gateway running, and is the endpoint id right?)" +
-        relayHint(),
+        relayHint() +
+        last,
       "TimeoutError",
-    ),
-  ).then(
+    );
+  }).then(
     () => {
       r.connected = true;
       r.downUntil = 0;

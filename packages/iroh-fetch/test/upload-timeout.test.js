@@ -58,7 +58,7 @@ test("AbortSignal.timeout aborts while waiting for the response", opts, async ()
   assert.equal((await iroh.fetch("/after-abort")).status, 200);
 });
 
-test("connecting to an unknown gateway fails fast with a clear error", opts, async () => {
+test("connecting to an unknown gateway fails within connectTimeout with a clear error", opts, async () => {
   // A freshly generated ed25519 key: a valid endpoint id that nobody is listening on.
   const { x } = generateKeyPairSync("ed25519").publicKey.export({ format: "jwk" });
   const ghost = Buffer.from(x, "base64url").toString("hex");

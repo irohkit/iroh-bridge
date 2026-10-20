@@ -111,7 +111,8 @@ export interface IrohFetch {
   /** The configured backends, their replicas and whether each is currently healthy. */
   backends: ReadonlyArray<{
     origin: string | null;
-    replicas: ReadonlyArray<{ endpointId: string; readonly healthy: boolean }>;
+    /** `connected`: has a live connection; `healthy`: not parked after a failure. */
+    replicas: ReadonlyArray<{ endpointId: string; readonly healthy: boolean; readonly connected: boolean }>;
     readonly connected: boolean;
   }>;
   /** Cookies stored from the (first) backend's `Set-Cookie` headers. Each backend has its own jar. */

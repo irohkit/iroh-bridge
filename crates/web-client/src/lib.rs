@@ -78,10 +78,12 @@ impl IrohClient {
     }
 
     /// Open the connection to the gateway `remote` now instead of on the first request.
-    pub fn connect(&self, remote: String) -> Promise {
+    /// `relay` (also on `request` and `websocket`) is the gateway's relay URL if known: it is
+    /// hinted instead of the configured relays, with an address lookup as the fallback.
+    pub fn connect(&self, remote: String, relay: Option<String>) -> Promise {
         let client = self.0.clone();
         future_to_promise(async move {
-            client.connect(&remote).await.map_err(js_val)?;
+            client.connect(&remote, relay.as_deref()).await.map_err(js_val)?;
             Ok(JsValue::UNDEFINED)
         })
     }
@@ -90,12 +92,12 @@ impl IrohClient {
     /// `undefined`, a `Uint8Array`, or a `ReadableStream<Uint8Array>` that is uploaded as it is read.
     /// Resolves to `{ status, headers, body: ReadableStream<Uint8Array> }`; the response body
     /// streams in as the backend produces it.
-    pub fn request(&self, remote: String, method: String, path: String, headers: JsValue, body: JsValue) -> Promise {
+    pub fn request(&self, remote: String, method: String, path: String, headers: JsValue, body: JsValue, relay: Option<String>) -> Promise {
         let client = self.0.clone();
         future_to_promise(async move {
             let head = RequestHead { method, path, headers: headers_from_js(headers)?, websocket: false };
             let body = body_from_js(body)?;
-            let (resp, body) = client.request(&remote, head, body).await.map_err(js_val)?;
+            let (resp, body) = client.request(&remote, relay.as_deref(), head, body).await.map_err(js_val)?;
             let out = response_object(&resp)?;
             Reflect::set(&out, &"body".into(), &body_stream(body).into())?;
             Ok(out.into())
@@ -105,10 +107,10 @@ impl IrohClient {
     /// Open a WebSocket to `path` on the backend. Resolves to `{ status, headers, socket }` where
     /// `socket` is set only when the backend accepted the upgrade (status 101); otherwise `body`
     /// holds the backend's error response.
-    pub fn websocket(&self, remote: String, path: String, headers: JsValue) -> Promise {
+    pub fn websocket(&self, remote: String, path: String, headers: JsValue, relay: Option<String>) -> Promise {
         let client = self.0.clone();
         future_to_promise(async move {
-            let (resp, outcome) = client.websocket(&remote, path, headers_from_js(headers)?).await.map_err(js_val)?;
+            let (resp, outcome) = client.websocket(&remote, relay.as_deref(), path, headers_from_js(headers)?).await.map_err(js_val)?;
             let out = response_object(&resp)?;
             match outcome {
                 WsOutcome::Socket(socket) => Reflect::set(&out, &"socket".into(), &WebSocketConn(socket).into())?,

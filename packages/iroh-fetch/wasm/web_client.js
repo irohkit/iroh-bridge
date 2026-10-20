@@ -153,13 +153,18 @@ export class IrohClient {
     }
     /**
      * Open the connection to the gateway `remote` now instead of on the first request.
+     * `relay` (also on `request` and `websocket`) is the gateway's relay URL if known: it is
+     * hinted instead of the configured relays, with an address lookup as the fallback.
      * @param {string} remote
+     * @param {string | null} [relay]
      * @returns {Promise<any>}
      */
-    connect(remote) {
+    connect(remote, relay) {
         const ptr0 = passStringToWasm0(remote, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.irohclient_connect(this.__wbg_ptr, ptr0, len0);
+        var ptr1 = isLikeNone(relay) ? 0 : passStringToWasm0(relay, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len1 = WASM_VECTOR_LEN;
+        const ret = wasm.irohclient_connect(this.__wbg_ptr, ptr0, len0, ptr1, len1);
         return ret;
     }
     /**
@@ -239,16 +244,19 @@ export class IrohClient {
      * @param {string} path
      * @param {any} headers
      * @param {any} body
+     * @param {string | null} [relay]
      * @returns {Promise<any>}
      */
-    request(remote, method, path, headers, body) {
+    request(remote, method, path, headers, body, relay) {
         const ptr0 = passStringToWasm0(remote, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(method, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len2 = WASM_VECTOR_LEN;
-        const ret = wasm.irohclient_request(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, headers, body);
+        var ptr3 = isLikeNone(relay) ? 0 : passStringToWasm0(relay, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len3 = WASM_VECTOR_LEN;
+        const ret = wasm.irohclient_request(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, headers, body, ptr3, len3);
         return ret;
     }
     /**
@@ -275,14 +283,17 @@ export class IrohClient {
      * @param {string} remote
      * @param {string} path
      * @param {any} headers
+     * @param {string | null} [relay]
      * @returns {Promise<any>}
      */
-    websocket(remote, path, headers) {
+    websocket(remote, path, headers, relay) {
         const ptr0 = passStringToWasm0(remote, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.irohclient_websocket(this.__wbg_ptr, ptr0, len0, ptr1, len1, headers);
+        var ptr2 = isLikeNone(relay) ? 0 : passStringToWasm0(relay, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len2 = WASM_VECTOR_LEN;
+        const ret = wasm.irohclient_websocket(this.__wbg_ptr, ptr0, len0, ptr1, len1, headers, ptr2, len2);
         return ret;
     }
 }

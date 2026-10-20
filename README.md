@@ -252,7 +252,7 @@ const iroh = await createIrohFetch({
 
 await iroh.fetch("https://files.example.com/report.pdf");
 await iroh.backend("https://files.example.com").fetch("/report.pdf"); // scoped view, same thing
-iroh.backends; // [{ origin, replicas: [{ endpointId, healthy }], connected }]
+iroh.backends; // [{ origin, replicas: [{ endpointId, relayUrl, healthy, connected }], connected }]
 ```
 
 All backends share one local iroh endpoint (one relay connection) and get one QUIC connection each. Each backend has its
@@ -279,6 +279,10 @@ backends: {
   next replica instead of hanging.
 - Put replicas on **different relays** (e.g. one on your relay, one on the public relays) to survive a relay outage; see
   [Redundancy](deploy/relay/README.md#7-redundancy-surviving-a-relay-outage).
+- A replica can name the relay it is on: `{ endpointId: "<gateway 2>", relayUrl: "https://aps1-1.relay.n0.iroh.link" }`.
+  It is then dialed via that relay instead of via the relays in your `relayUrl`, so a standby on another relay connects
+  in a fraction of a second instead of waiting for an address lookup (median 0.2 s vs 1.1 s, with rare lookups of
+  15 s+). It is only a hint: if the gateway moved to another relay, the dial still finds it through the lookup.
 - Requests without a body are retried on the next replica if one fails mid-request. Requests with a body (it streams
   and can't be replayed) only fail over while connecting, before anything was sent.
 - WebSockets and EventSource connect to a healthy replica; EventSource reconnects to the next one if the stream drops.
@@ -435,7 +439,7 @@ expect the network's RTT instead of the relay detour, not these absolute numbers
 | Option | Default | |
 |---|---|---|
 | `endpointId` / `endpointIds` | | one backend: a gateway id, or several replicas |
-| `backends` | | `{ [origin]: id \| id[] \| { endpointId?, endpointIds?, strategy?, default? } }` |
+| `backends` | | `{ [origin]: id \| replica[] \| { endpointId?, relayUrl?, endpointIds?, strategy?, default? } }`; a replica is an id or `{ endpointId, relayUrl }` |
 | `strategy` | `"failover"` | `"failover"` or `"round-robin"` over replicas |
 | `failoverCooldown` | `10000` | ms an unreachable replica is skipped |
 | `connect` | `true` | dial all gateways up front (otherwise on first use) |
@@ -443,7 +447,7 @@ expect the network's RTT instead of the relay detour, not these absolute numbers
 | `cookies` | `true` | keep and send cookies |
 | `persistCookies` | `false` | `true` (localStorage) or a `Storage` |
 | `cache` | `false` | client HTTP cache: `true` or `{ maxEntries?: 500, maxBytes?: 50e6, storage?: "memory" \| "cache-api" }` ([details](#http-cache-cache-option)) |
-| `relayUrl` | n0 public relays | your own relay ([guide](deploy/relay/README.md)) |
+| `relayUrl` | n0 public relays | your own relay ([guide](deploy/relay/README.md)), or a list such as `["https://relay-a…", "https://relay-b…", "n0"]` (all own relays get the one `relayToken`, n0's never do) |
 | `relayToken` | | token for a relay that requires one: a string, or a function returning one (sync or async), best served by your backend ([details](#relay-token-from-your-backend)) |
 | `relayTokenRefreshMs` | `0` | with a `relayToken` function, also call it every this many ms (default: only when the relay refuses the client) |
 | `secretKey` | random | fixed client identity (64 hex chars) |
@@ -717,8 +721,8 @@ back to `NEXT_PUBLIC_IROH_RELAY_TOKEN` when the server has no `IROH_RELAY_TOKEN`
   Browser-specific bugs found and fixed this way: Firefox has no `Request.body` stream; WebKit rejects relay hostnames
   ending in a dot, for WebSockets and for the relay latency probes; and apps never became ready where service workers
   can't take control. Running the matrix repeatedly also showed that a standby gateway on another relay sometimes took
-  15 s+ to dial. Clients now add a plain address-lookup dial after 1.5 s, and replicas that failed keep retrying in the
-  background with backoff, so standbys are connected before they're needed.
+  15 s+ to dial. Clients now add a plain address-lookup dial after 1.5 s, replicas that failed keep retrying in the
+  background with backoff, and the demo names its standbys' relay, so standbys are connected before they're needed.
 - **Load** ([`scripts/loadtest.mjs`](scripts/loadtest.mjs), relay on a 2-core VPS): 0 errors at 1,000 req/s from 100
   clients, 100 concurrent WebSockets and 50 clients of mixed traffic, with ~13 ms latency throughout. The gateways used
   ~15% of a core at 500 req/s each; the relay's TLS front end (Caddy) is what saturates first (~58% CPU at 1,000 req/s).

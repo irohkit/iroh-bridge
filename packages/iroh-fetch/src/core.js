@@ -259,6 +259,7 @@ export function makeCreate(init) {
         origin: b.origin,
         replicas: b.replicas.map((r) => ({
           endpointId: r.endpointId,
+          relayUrl: r.relayUrl,
           get healthy() {
             return r.downUntil <= Date.now();
           },
@@ -295,10 +296,19 @@ export function makeCreate(init) {
 }
 
 function parseBackends(options) {
+  // A replica is an endpoint id, or { endpointId, relayUrl } naming the relay that gateway is on.
+  const replicaOf = (entry, what) => {
+    const id = entry && typeof entry === "object" ? entry.endpointId : entry;
+    if (!id) throw new Error(`iroh-fetch: ${what} needs an endpointId`);
+    return { endpointId: String(id).trim(), relayUrl: relayHintOf(entry?.relayUrl, what), downUntil: 0, connected: false };
+  };
   const replicasOf = (cfg, what) => {
-    const ids = typeof cfg === "string" ? [cfg] : Array.isArray(cfg) ? cfg : (cfg?.endpointIds ?? (cfg?.endpointId ? [cfg.endpointId] : []));
-    if (!ids.length) throw new Error(`iroh-fetch: ${what} needs an endpointId`);
-    return ids.map((id) => ({ endpointId: String(id).trim(), downUntil: 0, connected: false }));
+    if (cfg?.endpointIds && cfg?.relayUrl) {
+      throw new Error(`iroh-fetch: ${what}: with endpointIds, give each replica its relay ({ endpointId, relayUrl })`);
+    }
+    const entries = typeof cfg === "string" ? [cfg] : Array.isArray(cfg) ? cfg : (cfg?.endpointIds ?? (cfg?.endpointId ? [cfg] : []));
+    if (!entries.length) throw new Error(`iroh-fetch: ${what} needs an endpointId`);
+    return entries.map((entry) => replicaOf(entry, what));
   };
   const strategyOf = (cfg) => {
     const s = (cfg && typeof cfg === "object" && !Array.isArray(cfg) && cfg.strategy) || "failover";
@@ -325,6 +335,23 @@ function parseBackends(options) {
   const ids = options?.endpointIds ?? options?.endpointId;
   if (!ids || (Array.isArray(ids) && !ids.length)) throw new Error("iroh-fetch: endpointId (or backends) is required");
   return [{ origin: null, host: null, replicas: replicasOf(ids, "endpointId"), strategy: options.strategy ?? "failover", next: Math.floor(Math.random() * 1024), default: true }];
+}
+
+/**
+ * Checks a replica's relay hint: one http(s) URL (e.g. "https://aps1-1.relay.n0.iroh.link"). It is
+ * a speed-up, not a requirement: a stale hint still falls back to the address lookup.
+ */
+function relayHintOf(relayUrl, what) {
+  if (relayUrl == null || relayUrl === "") return undefined;
+  const s = String(relayUrl).trim();
+  let url;
+  try {
+    url = new URL(s);
+  } catch {}
+  if (!url || (url.protocol !== "https:" && url.protocol !== "http:") || s.includes(",")) {
+    throw new Error(`iroh-fetch: ${what}: relayUrl must be one http(s) URL, got ${JSON.stringify(relayUrl)}`);
+  }
+  return s;
 }
 
 /**
@@ -388,7 +415,7 @@ function connectWithTimeout(client, r, ms) {
   const attempt = async () => {
     for (let delay = 250; ; delay = Math.min(delay * 2, 2000)) {
       try {
-        return await client.connect(id);
+        return await client.connect(id, r.relayUrl);
       } catch (err) {
         lastErr = err;
         if (stopped || !ms || /refused this client/.test(client.relayProblem?.() ?? "")) throw err;
@@ -427,7 +454,7 @@ function connectWithTimeout(client, r, ms) {
 /** The per-backend view of the shared client that IrohWebSocket expects, with failover. */
 function gatewayClient(client, b) {
   return {
-    websocket: (path, headers) => withFailover(b, (r) => client.websocket(r.endpointId, path, headers)),
+    websocket: (path, headers) => withFailover(b, (r) => client.websocket(r.endpointId, path, headers, r.relayUrl)),
   };
 }
 
@@ -471,7 +498,7 @@ async function fetchOverIroh(client, route, forced, input, init, cache) {
     withFailover(
       backend,
       async (r) => {
-        const pending = client.request(r.endpointId, method, path, sentHeaders, upload);
+        const pending = client.request(r.endpointId, method, path, sentHeaders, upload, r.relayUrl);
         return hasSignal ? await raceAbort(pending, signal, (late) => late.body.cancel()) : await pending;
       },
       () => replayable,

@@ -1,59 +1,236 @@
 name: release-gateway
 
-# Attaches prebuilt iroh-gateway binaries to the GitHub release for each tag.
+# Builds iroh-gateway for every platform, tests the installers against the fresh archives, and
+# attaches the archives to the GitHub release for each tag. Pull requests and manual runs without
+# a tag only build and test; nothing is published.
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - "crates/gateway/**"
+      - "crates/proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/install-gateway.*"
+      - "deploy/install.sh"
+      - "deploy/iroh-gateway.service"
+      - ".github/workflows/release-gateway.yml"
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to build and attach binaries to (e.g. v0.1.3)
-        required: true
+        description: Existing tag to build and attach binaries to (e.g. v0.1.3); empty = build and test only
+        required: false
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  # Asset names carry the tag; untagged builds are called "dev".
+  TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || 'dev' }}
 
 jobs:
   build:
+    name: build ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Built on 22.04 so the binaries run on distros with glibc >= 2.35.
+          # glibc builds on 22.04 so they run on distros with glibc >= 2.35.
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          # Static musl builds: no libc dependency at all, so they also run on Alpine and old glibc.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-musl, musl: true }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-musl, musl: true }
           - { os: macos-latest, target: aarch64-apple-darwin }
+          # Cross-compiled on the arm64 runner.
+          - { os: macos-latest, target: x86_64-apple-darwin, cross: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, windows: true }
     runs-on: ${{ matrix.os }}
-    env:
-      TAG: ${{ inputs.tag || github.ref_name }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ inputs.tag || '' }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
-        run: cargo build --release --locked -p iroh-gateway
-      - name: Package
+        run: |
+          if [ "${{ matrix.musl }}" = true ]; then
+            # ring compiles C code; build it against musl too. Rust links musl statically by default.
+            export "CC_$(echo '${{ matrix.target }}' | tr - _)=musl-gcc"
+          fi
+          cargo build --release --locked -p iroh-gateway --target ${{ matrix.target }}
+      - name: Check the binary
+        run: |
+          bin=target/${{ matrix.target }}/release/iroh-gateway${{ matrix.windows && '.exe' || '' }}
+          file "$bin" || true
+          if [ "${{ matrix.musl }}" = true ]; then
+            file "$bin" | grep -Eq 'statically linked|static-pie linked' || { echo "not a static binary"; exit 1; }
+          fi
+          if [ "${{ matrix.cross }}" != true ]; then "$bin" --help > /dev/null; fi
+      - name: Package (tar.gz)
+        if: ${{ !matrix.windows }}
         run: |
           name="iroh-gateway-$TAG-${{ matrix.target }}"
           mkdir "$name"
-          cp target/release/iroh-gateway LICENSE "$name/"
-          if [ -f deploy/iroh-gateway.service ]; then cp deploy/iroh-gateway.service "$name/"; fi
+          cp target/${{ matrix.target }}/release/iroh-gateway LICENSE deploy/iroh-gateway.service "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Package (zip)
+        if: matrix.windows
+        shell: pwsh
+        run: |
+          $name = "iroh-gateway-$env:TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/iroh-gateway.exe, LICENSE $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLowerInvariant()
+          # Same format as shasum: "<hash>  <file>", LF line ending.
+          [IO.File]::WriteAllText("$PWD/$name.zip.sha256", "$hash  $name.zip`n")
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: iroh-gateway-*.tar.gz*
+          path: |
+            iroh-gateway-*.tar.gz*
+            iroh-gateway-*.zip*
+          if-no-files-found: error
+
+  # Runs the installers the way users do, against the archives built above (served from a local
+  # directory or an HTTP server laid out like the release download URLs).
+  install-test:
+    name: install ${{ matrix.name }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: ubuntu, os: ubuntu-latest }
+          - { name: ubuntu-arm, os: ubuntu-22.04-arm }
+          - { name: macos, os: macos-latest }
+          - { name: windows, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || '' }}
+          sparse-checkout: |
+            scripts
+            deploy
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/dist/${{ env.TAG }}
+          merge-multiple: true
+      - name: Lint the shell installer
+        if: matrix.name == 'ubuntu'
+        run: shellcheck -s sh scripts/install-gateway.sh
+
+      - name: sh installer (local archives, user directory)
+        if: runner.os != 'Windows'
+        run: |
+          dir="$RUNNER_TEMP/bin"
+          IROH_GATEWAY_BASE_URL="$RUNNER_TEMP/dist" IROH_GATEWAY_VERSION="$TAG" IROH_GATEWAY_INSTALL_DIR="$dir" \
+            sh scripts/install-gateway.sh | tee out.txt
+          "$dir/iroh-gateway" --help
+          if [ "$RUNNER_OS" = Linux ]; then
+            grep -q -- "-unknown-linux-musl.tar.gz" out.txt || { echo "expected the musl build"; exit 1; }
+            file "$dir/iroh-gateway" | grep -Eq 'statically linked|static-pie linked'
+          fi
+      - name: sh installer piped into sh, over HTTP with wget only (Alpine)
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$RUNNER_TEMP/dist" > /dev/null 2>&1 &
+          sleep 1
+          docker run --rm --network host -v "$PWD/scripts:/s:ro" alpine:3.20 sh -euc '
+            command -v curl && exit 1
+            IROH_GATEWAY_BASE_URL=http://127.0.0.1:8765 IROH_GATEWAY_VERSION="'"$TAG"'" sh -s < /s/install-gateway.sh
+            iroh-gateway --help
+            command -v iroh-gateway'
+      - name: sh installer refuses a corrupted download
+        if: runner.os != 'Windows'
+        run: |
+          cp -R "$RUNNER_TEMP/dist" "$RUNNER_TEMP/bad"
+          for f in "$RUNNER_TEMP"/bad/"$TAG"/*.tar.gz; do echo garbage >> "$f"; done
+          if IROH_GATEWAY_BASE_URL="$RUNNER_TEMP/bad" IROH_GATEWAY_VERSION="$TAG" IROH_GATEWAY_INSTALL_DIR="$RUNNER_TEMP/bad-bin" \
+               sh scripts/install-gateway.sh 2> err.txt; then
+            echo "installed a corrupted archive"; exit 1
+          fi
+          grep -q "checksum mismatch" err.txt
+          test ! -e "$RUNNER_TEMP/bad-bin/iroh-gateway"
+      - name: sh installer --systemd
+        if: matrix.name == 'ubuntu'
+        run: |
+          # deploy/install.sh is fetched as RAW/<tag>/deploy/install.sh; point it at this checkout.
+          mkdir -p "$RUNNER_TEMP/raw"
+          ln -s "$PWD" "$RUNNER_TEMP/raw/$TAG"
+          if sh scripts/install-gateway.sh --systemd http://127.0.0.1:8080 2> err.txt; then
+            echo "--systemd should refuse to run without root"; exit 1
+          fi
+          grep -q "needs root" err.txt
+          sudo env IROH_GATEWAY_BASE_URL="$RUNNER_TEMP/dist" IROH_GATEWAY_RAW_URL="$RUNNER_TEMP/raw" IROH_GATEWAY_VERSION="$TAG" \
+            sh scripts/install-gateway.sh --systemd http://127.0.0.1:8080
+          systemctl is-active iroh-gateway
+          grep -q '^Environment=BACKEND_URL=http://127.0.0.1:8080$' /etc/systemd/system/iroh-gateway.service
+          /usr/local/bin/iroh-gateway --help > /dev/null
+          sudo journalctl -u iroh-gateway --no-pager | tail -20
+
+      - name: PowerShell installer (pwsh, run as a file)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'gw-pwsh'
+          ./scripts/install-gateway.ps1 -BaseUrl "$env:RUNNER_TEMP/dist" -Version $env:TAG -InstallDir $dir -NoPathUpdate
+          & "$dir/iroh-gateway.exe" --help
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: PowerShell installer (Windows PowerShell 5.1, irm | iex, default location)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:IROH_GATEWAY_BASE_URL = "$env:RUNNER_TEMP/dist"
+          $env:IROH_GATEWAY_VERSION = $env:TAG
+          Get-Content -Raw ./scripts/install-gateway.ps1 | Invoke-Expression
+          $exe = Join-Path $env:LOCALAPPDATA 'iroh-gateway\iroh-gateway.exe'
+          if (-not (Test-Path $exe)) { throw "not installed at $exe" }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (($userPath -split ';') -notcontains (Split-Path $exe)) { throw "user PATH not updated: $userPath" }
+          # The installer also updates PATH for the current session.
+          iroh-gateway --help
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: PowerShell installer refuses a corrupted download
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bad = Join-Path $env:RUNNER_TEMP 'bad'
+          Copy-Item -Recurse "$env:RUNNER_TEMP/dist" $bad
+          Get-ChildItem "$bad/$env:TAG/*.zip" | ForEach-Object { Add-Content -LiteralPath $_.FullName 'garbage' }
+          $failed = $false
+          try {
+            ./scripts/install-gateway.ps1 -BaseUrl $bad -Version $env:TAG -InstallDir (Join-Path $env:RUNNER_TEMP 'gw-bad') -NoPathUpdate
+          } catch {
+            $failed = $true
+            if ("$_" -notmatch 'checksum mismatch') { throw "unexpected error: $_" }
+          }
+          if (-not $failed) { throw 'installed a corrupted archive' }
 
   release:
-    needs: build
+    needs: [build, install-test]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
-      TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
@@ -64,4 +241,4 @@ jobs:
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" \
                  --notes "iroh-fetch on npm: https://www.npmjs.com/package/iroh-fetch/v/${TAG#v}"
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber iroh-gateway-*.tar.gz*
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber iroh-gateway-*.tar.gz* iroh-gateway-*.zip*

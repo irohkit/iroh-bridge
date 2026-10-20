@@ -464,12 +464,34 @@ Node.js `engine` and `connectionInfo(endpointId?)`.
 
 ### Install
 
-- **Binary**: download it for Linux x86_64/arm64 or macOS arm64 from the
-  [releases](https://github.com/irohkit/iroh-bridge/releases), or `cargo build --release -p iroh-gateway`.
+- **Linux / macOS**, one line (installs to `/usr/local/bin` as root or when writable, else `~/.local/bin`):
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/irohkit/iroh-bridge/main/scripts/install-gateway.sh | sh
+  ```
+  It picks the build for your OS and CPU, verifies its SHA-256 and prints the next steps. Pin a release with
+  `IROH_GATEWAY_VERSION=v0.5.1` or choose the directory with `IROH_GATEWAY_INSTALL_DIR=...` (set them on the `sh` side
+  of the pipe). Needs only `curl` or `wget`, `tar` and `sha256sum` or `shasum`.
+- **Windows** (PowerShell; installs to `%LOCALAPPDATA%\iroh-gateway` and adds it to your user `PATH`, no admin needed):
+  ```powershell
+  irm https://raw.githubusercontent.com/irohkit/iroh-bridge/main/scripts/install-gateway.ps1 | iex
+  ```
 - **systemd** (starts on boot, its own user, key in `/var/lib/iroh-gateway`):
   ```bash
-  sudo ./deploy/install.sh http://127.0.0.1:8080
+  curl -fsSL https://raw.githubusercontent.com/irohkit/iroh-bridge/main/scripts/install-gateway.sh | sudo sh -s -- --systemd http://127.0.0.1:8080
+  # or from a checkout, with a binary you built or downloaded:
+  sudo ./deploy/install.sh http://127.0.0.1:8080 [path/to/iroh-gateway]
   ```
+- **Manual download** from the [releases](https://github.com/irohkit/iroh-bridge/releases) (each archive has a
+  `.sha256` next to it), or build it with `cargo build --release -p iroh-gateway`:
+
+  | Platform | Release asset |
+  |---|---|
+  | Linux x86_64 / arm64, static (any distro, including Alpine and old glibc) | `iroh-gateway-<tag>-{x86_64,aarch64}-unknown-linux-musl.tar.gz` |
+  | Linux x86_64 / arm64, glibc ≥ 2.35 | `iroh-gateway-<tag>-{x86_64,aarch64}-unknown-linux-gnu.tar.gz` |
+  | macOS Apple silicon / Intel | `iroh-gateway-<tag>-{aarch64,x86_64}-apple-darwin.tar.gz` |
+  | Windows x64 (also runs on Windows 11 on ARM) | `iroh-gateway-<tag>-x86_64-pc-windows-msvc.zip` |
+
+  On Windows, config reload on SIGHUP (`systemctl reload`) doesn't exist; restart the gateway instead. Ctrl-C stops it.
 - **Docker**: `ghcr.io/irohkit/iroh-gateway`; see [`deploy/docker`](deploy/docker) for `docker run` and a compose file.
 
 The gateway prints `IROH_ENDPOINT_ID=...` at startup (`journalctl -u iroh-gateway | grep IROH_ENDPOINT_ID`). The id stays

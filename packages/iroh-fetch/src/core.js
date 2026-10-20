@@ -8,6 +8,7 @@ import { IrohXMLHttpRequest, routedXMLHttpRequest } from "./xhr.js";
 const NULL_BODY_STATUS = new Set([101, 103, 204, 205, 304]);
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 20;
+const REQUEST_HAS_BODY_STREAM = typeof Request !== "undefined" && "body" in Request.prototype;
 // Used as the origin for path-only requests such as fetch("/api/users").
 const DEFAULT_ORIGIN = "http://iroh.invalid";
 const DEFAULT_HOST = "iroh.invalid";
@@ -45,7 +46,9 @@ export function makeCreate(init) {
     try {
       storedKey = idStore?.getItem(idKey) ?? undefined;
     } catch {}
-    const client = await IrohClient.create(relayUrl ?? undefined, relayToken ?? undefined, secretKey ?? storedKey ?? undefined);
+    // Several relays (e.g. your own plus "n0" as a fallback) arrive as one comma-separated list.
+    const relays = Array.isArray(relayUrl) ? relayUrl.join(",") : relayUrl;
+    const client = await IrohClient.create(relays || undefined, relayToken ?? undefined, secretKey ?? storedKey ?? undefined);
     if (idStore && !storedKey && !secretKey) {
       try {
         idStore.setItem(idKey, client.secretKey());
@@ -334,11 +337,17 @@ async function fetchOverIroh(client, route, forced, input, init) {
   let method = req.method;
   let headers = new Headers(req.headers);
   let body = streamBody ?? req.body ?? undefined;
+  // Firefox has no Request.body stream, so read the (already encoded) body in one piece there.
+  if (!body && !REQUEST_HAS_BODY_STREAM && req.method !== "GET" && req.method !== "HEAD") {
+    const bytes = new Uint8Array(await req.arrayBuffer());
+    if (bytes.byteLength) body = bytes;
+  }
   let redirected = false;
 
   // Requests without a body can be replayed, so a failure on one replica moves on to the next.
   // Ones with a (streamed) body only fail over while connecting, before anything was sent.
-  const replayable = !body;
+  // Bytes (Firefox's buffered body) can be sent again; a stream is consumed by the first attempt.
+  const replayable = !(body instanceof ReadableStream);
   const send = (path, sentHeaders, upload) =>
     withFailover(
       backend,
@@ -346,7 +355,7 @@ async function fetchOverIroh(client, route, forced, input, init) {
         const pending = client.request(r.endpointId, method, path, sentHeaders, upload);
         return hasSignal ? await raceAbort(pending, signal, (late) => late.body.cancel()) : await pending;
       },
-      () => replayable && !upload,
+      () => replayable,
     );
 
   for (let hop = 0; ; hop++) {
@@ -357,7 +366,7 @@ async function fetchOverIroh(client, route, forced, input, init) {
       if (cookie) sent.set("cookie", cookie);
     }
     // Aborting errors the upload, which resets the stream so the gateway drops the request.
-    const upload = body && hasSignal ? body.pipeThrough(new TransformStream(), { signal }) : body;
+    const upload = body instanceof ReadableStream && hasSignal ? body.pipeThrough(new TransformStream(), { signal }) : body;
     const res = await send(url.pathname + url.search, [...sent], upload);
     jar?.store(res.headers, url.pathname);
 
@@ -376,7 +385,7 @@ async function fetchOverIroh(client, route, forced, input, init) {
       }
       const toGet = res.status === 303 ? method !== "HEAD" : (res.status === 301 || res.status === 302) && method === "POST";
       // 307/308 must replay the body, which is already consumed once streamed; hand those back.
-      if (toGet || !body) {
+      if (toGet || !(body instanceof ReadableStream)) {
         res.body.cancel();
         if (toGet) {
           method = method === "HEAD" ? "HEAD" : "GET";

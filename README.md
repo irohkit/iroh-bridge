@@ -45,6 +45,7 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
   - [Monitoring](#monitoring)
 - [Local port: `iroh-proxy`](#local-port-iroh-proxy)
 - [Run your own relay](#run-your-own-relay)
+- [Tested](#tested)
 - [Production notes](#production-notes)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -236,7 +237,12 @@ backends: {
 // single-backend shorthand: createIrohFetch({ endpointIds: [...], strategy })
 ```
 
-- A replica that can't be reached is skipped for `failoverCooldown` ms (default 10 s), then tried again.
+- A replica that can't be reached is skipped for `failoverCooldown` ms (default 10 s); it reconnects in the background
+  and, with `"failover"`, becomes the preferred replica again once it's back.
+- Clients notice a dead connection within ~5 s (keep-alives every second), so in-flight body-less requests move to the
+  next replica instead of hanging.
+- Put replicas on **different relays** (e.g. one on your relay, one on the public relays) to survive a relay outage; see
+  [Redundancy](deploy/relay/README.md#7-redundancy-surviving-a-relay-outage).
 - Requests without a body are retried on the next replica if one fails mid-request. Requests with a body (it streams
   and can't be replayed) only fail over while connecting, before anything was sent.
 - WebSockets and EventSource connect to a healthy replica; EventSource reconnects to the next one if the stream drops.
@@ -498,6 +504,18 @@ createIrohFetch({ relayUrl: "https://relay.example.com", relayToken: "<token, if
 
 Leave both unset to stay on the public relays.
 
+## Tested
+
+- **Browsers:** the demo's 17-check self-test passes in Chromium, Firefox 157, WebKit 27 (Safari's engine) and an
+  emulated iPhone ([`scripts/browser-test.py`](scripts/browser-test.py)). Two browser-specific bugs were found and fixed
+  this way: Firefox has no `Request.body` stream, and WebKit refuses relay hostnames ending in a dot.
+- **Load** ([`scripts/loadtest.mjs`](scripts/loadtest.mjs), relay on a 2-core VPS): 0 errors at 1,000 req/s from 100
+  clients, 100 concurrent WebSockets and 50 clients of mixed traffic, with ~13 ms latency throughout. The gateways used
+  ~15% of a core at 500 req/s each; the relay's TLS front end (Caddy) is what saturates first (~58% CPU at 1,000 req/s).
+  Opening a connection (page load to first response) takes ~85 ms p50 with your own relay configured.
+- **Relay outage:** see [Redundancy](deploy/relay/README.md#7-redundancy-surviving-a-relay-outage).
+- **Security:** see [Security](#security).
+
 ## Production notes
 
 - **Run your own relay**: n0's public relays are fine for development but have no SLA and may be rate limited. See
@@ -536,11 +554,15 @@ Build the WASM (needs Rust with `wasm32-unknown-unknown`, `clang`, `wasm-bindgen
 ./scripts/build-wasm.sh
 ```
 
-Run the end-to-end tests against running gateways in front of `examples/backend` (A on two gateways, B on one):
+Run the end-to-end tests against running gateways in front of `examples/backend` (A on two gateways, B on one), the
+browser self-test, and the load test:
 
 ```bash
 cd packages/iroh-fetch
 IROH_ENDPOINT_ID=<A1> IROH_ENDPOINT_ID_A2=<A2> IROH_ENDPOINT_ID_B=<B> npm test
+# add IROH_RELAY_URL / IROH_RELAY_TOKEN when the gateways use your own relay
+python3 scripts/browser-test.py https://your-demo.example.com/
+node scripts/loadtest.mjs --help
 ```
 
 **Releasing**: bump `packages/iroh-fetch/package.json`, commit, and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`).

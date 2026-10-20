@@ -19,8 +19,9 @@ Measured on the demo with the same gateways and backend:
 4. [Point gateways and clients at it](#4-point-gateways-and-clients-at-it)
 5. [Tokens: only let authorized clients use it](#5-tokens-only-let-authorized-clients-use-it)
 6. [Check that it works](#6-check-that-it-works)
-7. [Operations](#7-operations)
-8. [Troubleshooting](#8-troubleshooting)
+7. [Redundancy: surviving a relay outage](#7-redundancy-surviving-a-relay-outage)
+8. [Operations](#8-operations)
+9. [Troubleshooting](#9-troubleshooting)
 
 ## 1. What you need
 
@@ -206,7 +207,42 @@ cd packages/iroh-fetch
 IROH_RELAY_URL=https://relay.example.com IROH_RELAY_TOKEN=web_... IROH_ENDPOINT_ID=<gateway id> npm test
 ```
 
-## 7. Operations
+## 7. Redundancy: surviving a relay outage
+
+A single relay is a single point of failure for browser users. The dependable pattern is to run **two gateways per
+backend on different relays** and let clients fail over between them:
+
+```bash
+# on the backend machine (or two machines)
+IROH_RELAY_URL=https://relay.example.com IROH_RELAY_TOKEN=gw_... IROH_KEY_FILE=/var/lib/iroh-gateway/key iroh-gateway   # primary
+IROH_KEY_FILE=/var/lib/iroh-gateway/key-standby iroh-gateway                                                            # standby on n0's public relays
+```
+
+```ts
+createIrohFetch({
+  relayUrl: ["https://relay.example.com", "n0"],   // own relay, plus the public relays to reach the standby
+  relayToken: "web_...",
+  backends: {
+    "https://api.example.com": { endpointIds: ["<primary id>", "<standby id>"], strategy: "failover" },
+  },
+});
+```
+
+What happens when your relay dies (tested by stopping the demo relay for 30 s while a client kept calling two backends):
+
+- clients notice the dead connection within about 5 seconds (1 s keep-alives) and move body-less requests to the
+  standby; at most the request that was in flight at that moment is delayed or fails;
+- everything then flows through the standby on the public relays;
+- when your relay is back, clients reconnect to the primary in the background and use it again.
+
+In the test, 624 requests over 130 s saw one failure (the in-flight request hit its 8 s timeout) and two slow requests.
+
+`relayUrl` / `IROH_RELAY_URL` also accept several relays, e.g. `https://relay-a.example.com,https://relay-b.example.com,n0`
+(`n0` = the public relays; your token is never sent to them). An endpoint then picks the lowest-latency relay that
+works. iroh decides that by measurement, not by list order, so use the two-gateway pattern above when you need to know
+which relay is primary.
+
+## 8. Operations
 
 - **Upgrades:** change the version (`cargo install iroh-relay --version X --features server --locked` then restart, or
   the image tag in `docker-compose.yml`). Keep relay and clients on compatible iroh versions (this project uses 1.3).
@@ -216,7 +252,7 @@ IROH_RELAY_URL=https://relay.example.com IROH_RELAY_TOKEN=web_... IROH_ENDPOINT_
 - **Several relays:** for users in different regions, run one relay per region and point each region's gateways at
   the nearest one. Clients reach any gateway through that gateway's relay.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|

@@ -211,9 +211,19 @@ async fn main() -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(upstream_connect_timeout)
         .build()?;
+    // Requests that can be sent again (no body, or a small one already received) connect in short
+    // attempts with a fresh socket each, within the same overall limit: a lost SYN then costs a
+    // few seconds instead of failing the request (seen on loaded hosts and container networks).
+    let connect_attempt = upstream_connect_timeout.min(CONNECT_ATTEMPT);
+    let http_retry = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect_attempt)
+        .build()?;
     let ctx = Arc::new(Ctx {
         gateway_id: endpoint.id().to_string(),
         http,
+        http_retry,
+        connect_attempt,
         policy: RwLock::new(Arc::new(policy)),
         max_body: args.max_body,
         max_head: args.max_head,
@@ -706,6 +716,9 @@ struct Ctx {
     /// replicas can tell which one answered.
     gateway_id: String,
     http: reqwest::Client,
+    /// Same client with `connect_attempt` as its connect timeout, for requests that can be retried.
+    http_retry: reqwest::Client,
+    connect_attempt: Duration,
     /// Routes and allow lists; replaced as a whole on reload, read as a snapshot per request.
     policy: RwLock<Arc<Policy>>,
     max_body: usize,
@@ -1177,7 +1190,24 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mu
     }
     let upload = Arc::new(Upload::new());
     let body = match with_limit(ctx.body_idle_timeout, recv.read_chunk(CHUNK_SIZE)).await {
-        Some(first) => request_body(recv, first?, ctx.max_body, ctx.body_idle_timeout, upload.clone()),
+        Some(first) => match first? {
+          None => UpstreamBody::None,
+          Some(first) => {
+            let mut received = Vec::new();
+            let complete = take_ready(&mut recv, first, &mut received).await?;
+            let total: usize = received.iter().map(bytes::Bytes::len).sum();
+            if total > ctx.max_body {
+                upload.fail(413);
+                info!("{} {} -> 413 (request body too large)", head.method, path_for_log(&head.path));
+                return reply(ctx, &mut out, send, Reject::BodyTooLarge, 413, "request body too large").await;
+            }
+            if complete {
+                UpstreamBody::Bytes(received.concat().into())
+            } else {
+                UpstreamBody::Stream(request_body(recv, received, ctx.max_body, ctx.body_idle_timeout, upload.clone()))
+            }
+          }
+        },
         None => {
             info!("{} {} -> 408 (no request body received)", head.method, path_for_log(&head.path));
             return reply(ctx, &mut out, send, Reject::BodyTimeout, 408, "request body timeout").await;
@@ -1308,10 +1338,20 @@ async fn handle_websocket(
     let mut attempt = None;
     for i in upstreams.order() {
         let upstream = &upstreams.urls[i];
-        let req = ws_request(upstream, &head)?;
-        let res = match tokio::time::timeout(ctx.upstream_connect_timeout, tokio_tungstenite::connect_async(req)).await {
-            Ok(res) => res,
-            Err(_) => Err(tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))),
+        // Fresh attempts (a handshake can always be repeated) until the connect timeout is used up.
+        let deadline = Instant::now() + ctx.upstream_connect_timeout;
+        let res = loop {
+            let left = deadline.saturating_duration_since(Instant::now()).min(ctx.connect_attempt);
+            let res = match tokio::time::timeout(left, tokio_tungstenite::connect_async(ws_request(upstream, &head)?)).await {
+                Ok(res) => res,
+                Err(_) => Err(tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))),
+            };
+            match &res {
+                Err(tungstenite::Error::Io(err)) if Instant::now() + ctx.connect_attempt / 2 < deadline => {
+                    debug!("WebSocket connect to {upstream} failed, trying again: {err}");
+                }
+                _ => break res,
+            }
         };
         match res {
             Err(err @ tungstenite::Error::Io(_)) => {
@@ -1492,18 +1532,17 @@ fn header_pairs(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
 /// backend sees as an incomplete request, never as a complete shorter one.
 fn request_body(
     recv: RecvStream,
-    first: Option<bytes::Bytes>,
+    received: Vec<bytes::Bytes>,
     max_body: usize,
     idle: Option<Duration>,
     upload: Arc<Upload>,
-) -> Option<reqwest::Body> {
-    let first = first?;
+) -> reqwest::Body {
     let chunks = futures_util::stream::try_unfold(
-        (recv, Some(first), 0usize),
-        move |(mut recv, pending, total)| {
+        (recv, std::collections::VecDeque::from(received), 0usize),
+        move |(mut recv, mut pending, total)| {
             let upload = upload.clone();
             async move {
-                let chunk = match pending {
+                let chunk = match pending.pop_front() {
                     Some(chunk) => Some(chunk),
                     None => match with_limit(idle, recv.read_chunk(CHUNK_SIZE)).await {
                         Some(chunk) => chunk.map_err(std::io::Error::other)?,
@@ -1522,11 +1561,47 @@ fn request_body(
                     upload.fail(413);
                     return Err(std::io::Error::other(format!("request body exceeds {max_body} bytes")));
                 }
-                Ok(Some((chunk, (recv, None, total))))
+                Ok(Some((chunk, (recv, pending, total))))
             }
         },
     );
-    Some(reqwest::Body::wrap_stream(chunks))
+    reqwest::Body::wrap_stream(chunks)
+}
+
+/// How much of a request body is kept so the request can be sent again after a failed connect.
+const SMALL_BODY: usize = 64 * 1024;
+/// One upstream connect attempt, for requests that can be retried (see `Ctx::http_retry`).
+const CONNECT_ATTEMPT: Duration = Duration::from_secs(3);
+/// How long to wait for the rest of a small request body before streaming it instead.
+const BODY_PEEK: Duration = Duration::from_millis(25);
+
+/// A request body as the upstream gets it. `Bytes` (complete and small) can be sent again.
+enum UpstreamBody {
+    None,
+    Bytes(bytes::Bytes),
+    Stream(reqwest::Body),
+}
+
+/// Moves the body into `received` if it is small and already (nearly) complete: reads for at most
+/// BODY_PEEK, up to about SMALL_BODY. True if that was the whole body, so the request can be
+/// replayed; otherwise the rest streams on as it arrives. The short wait covers a FIN that comes a
+/// packet after the data, and only delays a body that is still being produced by that much.
+async fn take_ready(recv: &mut RecvStream, first: bytes::Bytes, received: &mut Vec<bytes::Bytes>) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + BODY_PEEK;
+    let mut total = first.len();
+    received.push(first);
+    while total < SMALL_BODY {
+        match tokio::time::timeout_at(deadline, recv.read_chunk(CHUNK_SIZE)).await {
+            Ok(Ok(Some(chunk))) => {
+                total += chunk.len();
+                received.push(chunk);
+            }
+            Ok(Ok(None)) => return Ok(true),
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => return Ok(false),
+        }
+    }
+    Ok(false)
 }
 
 /// Headers set by the gateway itself. Clients can't supply them, so the backend can trust them.
@@ -1572,26 +1647,54 @@ async fn forward_any<'a>(
     ctx: &Ctx,
     upstreams: &'a Upstreams,
     head: &RequestHead,
-    mut body: Option<reqwest::Body>,
+    mut body: UpstreamBody,
 ) -> Result<(reqwest::Response, &'a str)> {
     let mut last_err = None;
     for i in upstreams.order() {
         let upstream = &upstreams.urls[i];
-        let replayable = body.is_none();
-        match forward(ctx, upstream, head, body.take()).await {
+        let result = match std::mem::replace(&mut body, UpstreamBody::None) {
+            // A streamed body can only be sent once: one attempt with the full connect timeout.
+            UpstreamBody::Stream(stream) => {
+                let result = forward(&ctx.http, upstream, head, Some(stream)).await;
+                if let Err(err) = &result
+                    && is_connect_error(err)
+                {
+                    upstreams.mark_failed(i, &format!("{err:#}"));
+                }
+                return result.map(|resp| {
+                    upstreams.mark_ok(i);
+                    (resp, upstream.as_str())
+                });
+            }
+            replayable => {
+                let bytes = match &replayable {
+                    UpstreamBody::Bytes(bytes) => Some(bytes.clone()),
+                    _ => None,
+                };
+                body = replayable;
+                // Fresh connect attempts until the configured connect timeout is used up.
+                let deadline = Instant::now() + ctx.upstream_connect_timeout;
+                loop {
+                    let result = forward(&ctx.http_retry, upstream, head, bytes.clone().map(reqwest::Body::from)).await;
+                    match &result {
+                        Err(err) if is_connect_error(err) && Instant::now() + ctx.connect_attempt / 2 < deadline => {
+                            debug!("connect to {upstream} failed, trying again: {err:#}");
+                        }
+                        _ => break result,
+                    }
+                }
+            }
+        };
+        match result {
             Ok(resp) => {
                 upstreams.mark_ok(i);
                 return Ok((resp, upstream));
             }
             Err(err) => {
-                let connect = err.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_connect() || e.is_timeout());
-                if !connect {
+                if !is_connect_error(&err) {
                     return Err(err);
                 }
                 upstreams.mark_failed(i, &format!("{err:#}"));
-                if !replayable {
-                    return Err(err);
-                }
                 last_err = Some(err);
             }
         }
@@ -1599,11 +1702,17 @@ async fn forward_any<'a>(
     Err(last_err.expect("at least one upstream"))
 }
 
-async fn forward(ctx: &Ctx, upstream: &str, head: &RequestHead, body: Option<reqwest::Body>) -> Result<reqwest::Response> {
+/// The request never reached the upstream (refused, unreachable, connect timed out), so sending
+/// it again is safe.
+fn is_connect_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_connect() || e.is_timeout())
+}
+
+async fn forward(http: &reqwest::Client, upstream: &str, head: &RequestHead, body: Option<reqwest::Body>) -> Result<reqwest::Response> {
     // `validate_head` already guarantees this; it is what keeps the target on `upstream`'s host.
     anyhow::ensure!(head.path.starts_with('/'), "path must start with /");
     let method = reqwest::Method::from_bytes(head.method.as_bytes())?;
-    let mut req = ctx.http.request(method, format!("{upstream}{}", head.path));
+    let mut req = http.request(method, format!("{upstream}{}", head.path));
     for (k, v) in &head.headers {
         if !HOP_HEADERS.contains(&k.to_ascii_lowercase().as_str()) {
             req = req.header(k, v);

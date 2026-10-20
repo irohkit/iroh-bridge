@@ -27,7 +27,8 @@ const socket = new WebSocket("wss://files.example.com/ws");
 - Optional client HTTP cache (`cache: true`): Cache-Control, ETag / Last-Modified revalidation, Vary, `Request.cache`
 - Optional fixed client identity (`persistIdentity`, `secretKey`)
 - Standard `WebSocket` and `EventSource` (reconnect, `Last-Event-ID`), plus custom headers
-- Many backends from one frontend, and HA replicas with failover or round-robin
+- Many backends from one frontend, and HA replicas with failover or round-robin; a replica can name the relay it is on
+  (`{ endpointId, relayUrl }`) so a standby on another relay connects without waiting for an address lookup
 - React: `import { IrohProvider, useIroh, useIrohFetch, IrohImage, useIrohObjectUrl } from "iroh-fetch/react"`
 - CLI: `npx -p iroh-fetch iroh-proxy <endpoint id> --port 8080` exposes a gateway on localhost
 - Node.js: a native addon (prebuilt for linux x64/arm64 glibc, linux x64 musl, macOS and Windows x64, installed as an

@@ -73,10 +73,10 @@ function wrap(addon) {
     connectionInfo(remote) {
       return this.#c.connectionInfo(remote) ?? null;
     }
-    connect(remote) {
-      return this.#c.connect(remote);
+    connect(remote, relay) {
+      return this.#c.connect(remote, relay ?? undefined);
     }
-    async request(remote, method, path, headers, body) {
+    async request(remote, method, path, headers, body, relay) {
       let bytes;
       let upload;
       if (body instanceof ReadableStream) {
@@ -88,7 +88,7 @@ function wrap(addon) {
       }
       let pending;
       try {
-        pending = this.#c.request(remote, method, path, headers ?? [], bytes, upload);
+        pending = this.#c.request(remote, method, path, headers ?? [], bytes, upload, relay ?? undefined);
       } catch (err) {
         upload?.abort(String(err?.message ?? err));
         throw err;
@@ -98,8 +98,8 @@ function wrap(addon) {
       const res = await pending;
       return { status: res.status, headers: res.headers, body: bodyStream(res) };
     }
-    async websocket(remote, path, headers) {
-      const res = await this.#c.websocket(remote, path, headers ?? []);
+    async websocket(remote, path, headers, relay) {
+      const res = await this.#c.websocket(remote, path, headers ?? [], relay ?? undefined);
       const out = { status: res.status, headers: res.headers };
       const socket = res.takeSocket();
       if (socket) out.socket = socket;

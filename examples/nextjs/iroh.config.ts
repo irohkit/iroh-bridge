@@ -10,18 +10,24 @@ import type { IrohFetchOptions } from "iroh-fetch";
 // Each backend has two gateways: the first on the demo's own (fast) relay, the second on n0's public
 // relays. "failover" uses the first and moves to the second if the own relay or that gateway goes
 // down, then comes back once it recovers.
+//
+// The standbys name their relay (n0's aps1-1, from their pkarr record: `relay=` in
+// https://dns.iroh.link/pkarr/<z-base-32 id>), so the client dials them via that relay right away
+// instead of waiting for an address lookup. The hint only speeds things up: if a standby's home relay
+// changes, the dial still finds it through the lookup.
+const STANDBY_RELAY = "https://aps1-1.relay.n0.iroh.link";
 const demoBackends: IrohFetchOptions["backends"] = {
   "https://api.demo": {
     endpointIds: [
       "acc0c8d6bc20700875b5fe1da1a3379f77f28dd16f8a66e3368856473ecc7a53",
-      "12cc92042d6d8048cc6ded53115b1b85c5ed1b08d2ff893695bac33228224558",
+      { endpointId: "12cc92042d6d8048cc6ded53115b1b85c5ed1b08d2ff893695bac33228224558", relayUrl: STANDBY_RELAY },
     ],
     strategy: "failover",
   },
   "https://files.demo": {
     endpointIds: [
       "61cf27b0bc13636193a9d64544acc08a1f7cf264801be90bfc88b6a10a5ec1f2",
-      "b436bfe3c115b845eede894d278fc65b36922db65eb852da16019fd0d971a931",
+      { endpointId: "b436bfe3c115b845eede894d278fc65b36922db65eb852da16019fd0d971a931", relayUrl: STANDBY_RELAY },
     ],
     strategy: "failover",
   },
@@ -32,7 +38,8 @@ export const backends: IrohFetchOptions["backends"] = process.env.NEXT_PUBLIC_IR
   : demoBackends;
 
 // Relay: n0's public relays unless you set your own (see deploy/relay/README.md). Set the same relay
-// the gateways use.
+// the gateways use, plus "n0" to reach the standbys: "https://relay.example.com,n0". Several own relays
+// work too ("https://relay-a.example.com,https://relay-b.example.com,n0"); they share one token.
 export const relayUrl = process.env.NEXT_PUBLIC_IROH_RELAY_URL || undefined;
 
 // If that relay requires a token, set IROH_RELAY_TOKEN (server-only): app/api/relay-token serves it

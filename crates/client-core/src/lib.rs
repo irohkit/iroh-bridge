@@ -1,9 +1,10 @@
 //! The iroh-http/1 client behind iroh-fetch, shared by the WASM build (`web-client`, browsers and
 //! Node.js without the native addon) and the native Node.js addon (`node-client`).
 //!
-//! It keeps one connection per gateway on a single local endpoint, dials with relay hints (plus a
-//! plain dial after 1.5 s), streams request and response bodies, and tunnels WebSockets. The
-//! bindings only translate between these types and their JavaScript counterparts.
+//! It keeps one connection per gateway on a single local endpoint, dials with relay hints (the
+//! gateway's own relay if the app named it, else all configured relays; plus a plain dial after
+//! 1.5 s), streams request and response bodies, and tunnels WebSockets. The bindings only
+//! translate between these types and their JavaScript counterparts.
 
 use std::{
     collections::HashMap,
@@ -62,6 +63,8 @@ pub struct Client {
     /// connection start right away instead of waiting for an address lookup (which also keeps
     /// running, so a gateway on another relay is still found).
     relay_hints: Vec<iroh::RelayUrl>,
+    /// Every relay in the relay map (n0's included), to match a per-gateway hint against.
+    known_relays: Vec<iroh::RelayUrl>,
     /// One connection per gateway, all sharing this endpoint (and its relay connection).
     conns: StdMutex<HashMap<EndpointId, Arc<Mutex<Option<Connection>>>>>,
 }
@@ -85,6 +88,7 @@ impl Client {
                 .build(),
         );
         let mut relay_hints = Vec::new();
+        let mut known_relays = RelayMode::Default.relay_map().urls();
         if let Some(hex) = options.secret_key.filter(|k| !k.is_empty()) {
             builder = builder.secret_key(parse_secret_key(&hex)?);
         }
@@ -92,10 +96,11 @@ impl Client {
             // In the browser the token travels as `?token=` on the relay WebSocket URL.
             let map = proto::relay_map(&spec, options.relay_token.as_deref())?;
             relay_hints = proto::listed_relays(&spec);
+            known_relays = map.urls();
             builder = builder.relay_mode(RelayMode::Custom(map));
         }
         let endpoint = builder.bind().await?;
-        Ok(Self { endpoint, relay_hints, conns: Default::default() })
+        Ok(Self { endpoint, relay_hints, known_relays, conns: Default::default() })
     }
 
     /// Why the home relay can't be used, if it can't: e.g. it refused the relay token. `None`
@@ -121,15 +126,22 @@ impl Client {
     }
 
     /// Opens the connection to `remote` now instead of on the first request.
-    pub async fn connect(&self, remote: &str) -> Result<()> {
-        self.connection(parse_remote(remote)?).await.map(drop)
+    ///
+    /// `relay` is the relay the gateway is known to use (its home relay). It replaces the
+    /// configured relays as the dial's hint; without it every relay listed in the client's relay
+    /// URL is hinted. Either way an address lookup also runs, so a wrong hint only costs time.
+    /// The same applies to `request` and `websocket`, which dial when there is no connection yet.
+    pub async fn connect(&self, remote: &str, relay: Option<&str>) -> Result<()> {
+        let hints = self.hints(relay)?;
+        self.connection(parse_remote(remote)?, &hints).await.map(drop)
     }
 
     /// Sends one HTTP request; resolves once the response head arrived. The body uploads in the
     /// background meanwhile, so the backend may answer (or stream back) before it is complete.
-    pub async fn request(&self, remote: &str, head: RequestHead, body: Body) -> Result<(ResponseHead, ResponseBody)> {
+    pub async fn request(&self, remote: &str, relay: Option<&str>, head: RequestHead, body: Body) -> Result<(ResponseHead, ResponseBody)> {
+        let hints = self.hints(relay)?;
         let remote = parse_remote(remote)?;
-        let (send, mut recv) = self.open(remote, &head).await?;
+        let (send, mut recv) = self.open(remote, &hints, &head).await?;
         let upload_error = Arc::new(StdMutex::new(None::<String>));
         n0_future::task::spawn({
             let upload_error = upload_error.clone();
@@ -150,10 +162,17 @@ impl Client {
 
     /// Opens a WebSocket to `path`. Returns the socket only when the backend accepted the upgrade
     /// (status 101); otherwise the body holds the backend's error response.
-    pub async fn websocket(&self, remote: &str, path: String, headers: Vec<(String, String)>) -> Result<(ResponseHead, WsOutcome)> {
+    pub async fn websocket(
+        &self,
+        remote: &str,
+        relay: Option<&str>,
+        path: String,
+        headers: Vec<(String, String)>,
+    ) -> Result<(ResponseHead, WsOutcome)> {
+        let hints = self.hints(relay)?;
         let remote = parse_remote(remote)?;
         let head = RequestHead { method: "GET".into(), path, headers, websocket: true };
-        let (send, mut recv) = self.open(remote, &head).await?;
+        let (send, mut recv) = self.open(remote, &hints, &head).await?;
         let resp: ResponseHead = proto::read_head(&mut recv).await?;
         let outcome = if resp.status == 101 {
             WsOutcome::Socket(WebSocket { send: Arc::new(Mutex::new(send)), recv: Arc::new(Mutex::new(recv)) })
@@ -197,12 +216,20 @@ impl Client {
         self.endpoint.close().await;
     }
 
+    /// The relays to hint when dialing a gateway: its own relay if given, else the configured ones.
+    fn hints(&self, relay: Option<&str>) -> Result<Vec<iroh::RelayUrl>> {
+        match relay.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(relay) => Ok(vec![proto::relay_hint(relay, &self.known_relays)?]),
+            None => Ok(self.relay_hints.clone()),
+        }
+    }
+
     fn slot(&self, remote: EndpointId) -> Arc<Mutex<Option<Connection>>> {
         self.conns.lock().expect("poisoned").entry(remote).or_default().clone()
     }
 
     /// Returns the live connection, dialing (again) if there is none or it was lost.
-    async fn connection(&self, remote: EndpointId) -> Result<Connection> {
+    async fn connection(&self, remote: EndpointId, hints: &[iroh::RelayUrl]) -> Result<Connection> {
         // Each gateway has its own slot, so dialing one doesn't hold up requests to another.
         let slot = self.slot(remote);
         let mut guard = slot.lock().await;
@@ -211,14 +238,14 @@ impl Client {
                 return Ok(conn.clone());
             }
         }
-        let addr = self
-            .relay_hints
+        let addr = hints
             .iter()
             .fold(iroh::EndpointAddr::new(remote), |addr, url| addr.with_relay_url(url.clone()));
-        // Hinting our own relays makes gateways on them fast to reach, but for a gateway on some
-        // other relay (e.g. a standby on n0's) the handshake first goes nowhere, and QUIC's
-        // retransmit backoff can then stretch the dial past 15 s. So if the hinted dial hasn't
-        // finished after a moment, also dial with address lookup alone and take whichever wins.
+        // Hinting the right relay makes the gateway fast to reach, but with a wrong hint (a gateway
+        // on another relay than ours that the app didn't name, or one whose home relay changed)
+        // the handshake first goes nowhere, and QUIC's retransmit backoff can then stretch the dial
+        // past 15 s. So if the hinted dial hasn't finished after a moment, also dial with address
+        // lookup alone and take whichever wins.
         let mut hinted = std::pin::pin!(self.endpoint.connect(addr, ALPN));
         let mut plain = std::pin::pin!(async {
             n0_future::time::sleep(Duration::from_millis(1500)).await;
@@ -236,13 +263,13 @@ impl Client {
     }
 
     /// Opens a fresh stream and sends the request head, retrying once on a stale connection.
-    async fn open(&self, remote: EndpointId, head: &RequestHead) -> Result<(SendStream, RecvStream)> {
-        let conn = self.connection(remote).await?;
+    async fn open(&self, remote: EndpointId, hints: &[iroh::RelayUrl], head: &RequestHead) -> Result<(SendStream, RecvStream)> {
+        let conn = self.connection(remote, hints).await?;
         let (mut send, recv) = match conn.open_bi().await {
             Ok(streams) => streams,
             Err(_) => {
                 *self.slot(remote).lock().await = None;
-                self.connection(remote).await?.open_bi().await?
+                self.connection(remote, hints).await?.open_bi().await?
             }
         };
         proto::write_head(&mut send, head).await?;

@@ -232,7 +232,10 @@ IROH_RELAY_URL=https://relay.example.com IROH_RELAY_TOKEN=web_... IROH_ENDPOINT_
 ## 7. Redundancy: surviving a relay outage
 
 A single relay is a single point of failure for browser users. The dependable pattern is to run **two gateways per
-backend on different relays** and let clients fail over between them:
+backend on different relays** and let clients fail over between them. The second relay can be n0's public ones (no
+second server needed) or a second relay of your own.
+
+### Standby on n0's public relays
 
 ```bash
 # on the backend machine (or two machines)
@@ -245,10 +248,31 @@ createIrohFetch({
   relayUrl: ["https://relay.example.com", "n0"],   // own relay, plus the public relays to reach the standby
   relayToken: "web_...",
   backends: {
-    "https://api.example.com": { endpointIds: ["<primary id>", "<standby id>"], strategy: "failover" },
+    "https://api.example.com": {
+      endpointIds: ["<primary id>", { endpointId: "<standby id>", relayUrl: "https://aps1-1.relay.n0.iroh.link" }],
+      strategy: "failover",
+    },
   },
 });
 ```
+
+**Name the standby's relay** (`{ endpointId, relayUrl }`). A client dials a gateway via the relays it lists in its own
+`relayUrl` (all of them except `n0`), and a gateway that isn't on one of those is only found through an address lookup
+on n0's DNS. That usually takes about a second, but in testing it sometimes took 15-20 s. With the relay named, the
+client dials it there directly: dialing the demo standby from a fresh client took a median of 0.2 s instead of 1.1 s
+(30 dials each, WASM and native alike).
+
+Find a gateway's relay in its published address record (the `relay=` entry):
+
+```bash
+ID=<endpoint id>   # 64 hex chars; the record is keyed by its z-base-32 form
+Z=$(python3 -c 'import sys;a="ybndrfg8ejkmcpqxot1uwisza345h769";n=int(sys.argv[1],16)<<4;print("".join(a[n>>(255-5*i)&31] for i in range(52)))' $ID)
+curl -s https://dns.iroh.link/pkarr/$Z | grep -ao 'relay=[^ "]*'
+```
+
+A gateway on n0's relays uses the one closest to it (`use1-1`, `usw1-1`, `euc1-1` or `aps1-1` `.relay.n0.iroh.link`)
+and may move if that relay is down or another one becomes faster. The hint is a speed-up, not a requirement: with a
+stale hint the client still finds the gateway through the address lookup, as if there were no hint.
 
 What happens when your relay dies (tested by stopping the demo relay for 30 s while a client kept calling two backends):
 
@@ -259,10 +283,46 @@ What happens when your relay dies (tested by stopping the demo relay for 30 s wh
 
 In the test, 624 requests over 130 s saw one failure (the in-flight request hit its 8 s timeout) and two slow requests.
 
-`relayUrl` / `IROH_RELAY_URL` also accept several relays, e.g. `https://relay-a.example.com,https://relay-b.example.com,n0`
-(`n0` = the public relays; your token is never sent to them). An endpoint then picks the lowest-latency relay that
-works. iroh decides that by measurement, not by list order, so use the two-gateway pattern above when you need to know
-which relay is primary.
+### A second relay of your own
+
+To stay off the public relays entirely, run a second relay on **another server** (another provider or region, so the
+two don't fail together), set up like the first one (section 2 or 3) under its own name, e.g. `relay-b.example.com`.
+Give it the **same tokens** as the first relay (`[access] shared_token`): a client has a single `relayToken`, which it
+presents to every relay it lists (never to n0's).
+
+Pin each gateway to one relay, so you know where each one is:
+
+```bash
+IROH_RELAY_URL=https://relay-a.example.com IROH_RELAY_TOKEN=gw_... IROH_KEY_FILE=/var/lib/iroh-gateway/key   iroh-gateway   # primary
+IROH_RELAY_URL=https://relay-b.example.com IROH_RELAY_TOKEN=gw_... IROH_KEY_FILE=/var/lib/iroh-gateway/key-b iroh-gateway   # standby
+```
+
+and list both relays on the clients (plus `n0` if you also keep a standby there):
+
+```ts
+createIrohFetch({
+  relayUrl: ["https://relay-a.example.com", "https://relay-b.example.com"],   // or "https://relay-a...,https://relay-b...,n0"
+  relayToken: "web_...",                                                      // accepted by both relays
+  backends: {
+    "https://api.example.com": {
+      endpointIds: [
+        { endpointId: "<primary id>", relayUrl: "https://relay-a.example.com" },
+        { endpointId: "<standby id>", relayUrl: "https://relay-b.example.com" },
+      ],
+      strategy: "failover",
+    },
+  },
+});
+```
+
+Naming the relays is optional here, since the client hints all the relays it lists anyway, but it saves a dial attempt
+via the wrong one. A relay a client should use with the token must be in its `relayUrl` list: a `relayUrl` on a replica
+alone dials without a token. The client itself sits on whichever listed relay answers fastest (iroh measures this, list
+order doesn't matter) and reaches gateways on the other relay just as well.
+
+`relayUrl` / `IROH_RELAY_URL` accept such a list on gateways too (`https://relay-a.example.com,https://relay-b.example.com`).
+A gateway then picks the lowest-latency relay that works and can move to the other one, but you no longer know
+which one it is on, so clients can't name it; prefer the pinned pair above.
 
 ## 8. Operations
 

@@ -124,6 +124,41 @@ test("single-backend shorthand accepts endpointIds", opts, async () => {
   assert.equal(res.headers.get("x-iroh-gateway-id"), A2);
 });
 
+// The relay A2 is on (from its pkarr record); the demo standby sits on n0's aps1-1.
+const A2_RELAY = process.env.IROH_RELAY_URL_A2 || "https://aps1-1.relay.n0.iroh.link";
+
+test("a replica's relayUrl is used to dial it", opts, async () => {
+  const iroh = await create({
+    relayUrl: [process.env.IROH_RELAY_URL, "n0"].filter(Boolean),
+    connectTimeout: 30_000,
+    backends: { "https://api.demo": { endpointIds: [{ endpointId: A2, relayUrl: A2_RELAY }], strategy: "failover" } },
+  });
+  const res = await iroh.fetch("https://api.demo/hello");
+  assert.equal(res.headers.get("x-iroh-gateway-id"), A2);
+  assert.equal(await backendOf(res), "A");
+  assert.equal(iroh.backends[0].replicas[0].relayUrl, A2_RELAY);
+});
+
+test("a stale relay hint still connects via the address lookup", opts, async () => {
+  // A1 is on the own relay (or n0's), not on this one.
+  const iroh = await create({ connectTimeout: 30_000, backends: { "https://api.demo": { endpointId: A1, relayUrl: "https://euc1-1.relay.n0.iroh.link" } } });
+  const res = await iroh.fetch("https://api.demo/hello");
+  assert.equal(res.headers.get("x-iroh-gateway-id"), A1);
+});
+
+test("replica relayUrl is validated", async () => {
+  const id = deadId();
+  const bad = [
+    [{ endpointIds: [{ endpointId: id, relayUrl: "relay.example.com" }] }, /relayUrl must be one http\(s\) URL/],
+    [{ endpointIds: [{ endpointId: id, relayUrl: "https://a.example.com,n0" }] }, /relayUrl must be one http\(s\) URL/],
+    [{ endpointIds: [{ relayUrl: "https://a.example.com" }] }, /needs an endpointId/],
+    [{ endpointIds: [id], relayUrl: "https://a.example.com" }, /give each replica its relay/],
+  ];
+  for (const [cfg, err] of bad) {
+    await assert.rejects(createIrohFetch({ connect: false, backends: { "https://api.demo": cfg } }), err);
+  }
+});
+
 test("objectUrl() returns a blob: URL of the body and rejects on errors", opts, async () => {
   const iroh = await create({ backends: { "https://api.demo": A1, "https://files.demo": B } });
   const url = await iroh.objectUrl("https://files.demo/image.svg");

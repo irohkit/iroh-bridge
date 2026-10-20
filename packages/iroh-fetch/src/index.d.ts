@@ -1,11 +1,23 @@
+/**
+ * One gateway: its endpoint id, or `{ endpointId, relayUrl }` when you know which relay it is on
+ * (its home relay, e.g. "https://aps1-1.relay.n0.iroh.link" for a gateway on n0's public relays).
+ * The client then dials it via exactly that relay instead of via the relays in `relayUrl`, which
+ * makes the first connection fast for a gateway on another relay than yours. The hint is a speed-up,
+ * not a requirement: if the gateway moved to another relay, the dial still falls back to an address
+ * lookup (a few seconds slower). A token-protected relay must also be listed in `relayUrl`.
+ */
+export type Replica = string | { endpointId: string; relayUrl?: string };
+
 export interface BackendConfig {
   endpointId?: string;
+  /** The relay the `endpointId` gateway is on; see {@link Replica}. */
+  relayUrl?: string;
   /**
    * Several gateways serving the same backend, for high availability. Requests go to a healthy one;
    * when one is unreachable the client fails over to the next and parks the bad one for
-   * `failoverCooldown` ms.
+   * `failoverCooldown` ms. Each may name its relay: `[{ endpointId, relayUrl }, ...]`.
    */
-  endpointIds?: string[];
+  endpointIds?: Replica[];
   /** "failover" (default): prefer them in order. "round-robin": spread requests across healthy ones. */
   strategy?: "failover" | "round-robin";
   /** Receives path-only requests such as fetch("/api/x") (default: the first backend). */
@@ -28,7 +40,7 @@ export interface IrohFetchOptions {
   /** Endpoint id printed by `iroh-gateway` on startup. Use this or `backends`. */
   endpointId?: string;
   /** Several gateways for one backend (high availability); see `BackendConfig.endpointIds`. */
-  endpointIds?: string[];
+  endpointIds?: Replica[];
   /** How replicas are picked when `endpointIds` has several (default "failover"). */
   strategy?: "failover" | "round-robin";
   /**
@@ -48,11 +60,13 @@ export interface IrohFetchOptions {
    * `{ "https://api.example.com": "<endpoint id>", "https://files.example.com": { endpointId } }`.
    * Requests are routed by URL host; all gateways share one local endpoint.
    */
-  backends?: Record<string, string | string[] | BackendConfig>;
+  backends?: Record<string, string | Replica[] | BackendConfig>;
   /**
    * Your own relay (recommended for production), or several: `["https://relay.example.com", "n0"]`
    * uses yours and falls back to n0's public relays if it's down ("n0" never gets your token).
-   * Default: n0's public relays.
+   * Several own relays (`["https://relay-a.example.com", "https://relay-b.example.com", "n0"]`) all
+   * get the same `relayToken`. Gateways without a {@link Replica} relay are dialed via all relays
+   * listed here (not n0's), plus an address lookup. Default: n0's public relays.
    */
   relayUrl?: string | string[];
   /**
@@ -200,7 +214,7 @@ export interface IrohFetch {
   backends: ReadonlyArray<{
     origin: string | null;
     /** `connected`: has a live connection; `healthy`: not parked after a failure. */
-    replicas: ReadonlyArray<{ endpointId: string; readonly healthy: boolean; readonly connected: boolean }>;
+    replicas: ReadonlyArray<{ endpointId: string; relayUrl?: string; readonly healthy: boolean; readonly connected: boolean }>;
     readonly connected: boolean;
   }>;
   /** Cookies stored from the (first) backend's `Set-Cookie` headers. Each backend has its own jar. */

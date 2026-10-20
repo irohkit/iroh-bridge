@@ -212,8 +212,35 @@ pub fn listed_relays(spec: &str) -> Vec<iroh::RelayUrl> {
         .collect()
 }
 
+/// Parses the relay hint for one gateway. If it names a relay from `known` (the client's relay
+/// map), that entry is returned, so the dial reuses the existing relay connection and its token.
+/// Hosts compare without a trailing dot: n0 writes its relays as `https://aps1-1.relay.n0.iroh.link./`,
+/// while a config file may well leave the dot out.
+pub fn relay_hint(hint: &str, known: &[iroh::RelayUrl]) -> Result<iroh::RelayUrl> {
+    let url: iroh::RelayUrl = hint.trim().parse().with_context(|| format!("invalid relay url {hint:?}"))?;
+    let key = |u: &iroh::RelayUrl| {
+        let host = u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase());
+        (u.scheme().to_owned(), host, u.port_or_known_default())
+    };
+    Ok(known.iter().find(|k| key(k) == key(&url)).cloned().unwrap_or(url))
+}
+
 #[cfg(test)]
 mod relay_tests {
+    #[test]
+    fn relay_hints_match_known_relays() {
+        let mut known: Vec<iroh::RelayUrl> = iroh::RelayMode::Default.relay_map().urls();
+        known.push("https://relay.example.com".parse().unwrap());
+        // Written without the trailing dot it still is n0's relay, so its connection is reused.
+        let hint = super::relay_hint("https://aps1-1.relay.n0.iroh.link", &known).unwrap();
+        assert!(known.contains(&hint), "{hint}");
+        assert_eq!(hint.host_str(), Some("aps1-1.relay.n0.iroh.link."));
+        assert_eq!(super::relay_hint(" https://relay.example.com/ ", &known).unwrap().as_str(), "https://relay.example.com/");
+        // A relay outside the map is dialed as given (iroh connects to it on demand).
+        assert_eq!(super::relay_hint("https://other.example.com", &known).unwrap().as_str(), "https://other.example.com/");
+        assert!(super::relay_hint("not a url", &known).is_err());
+    }
+
     #[test]
     fn relay_lists_and_public_fallback() {
         let own = super::relay_map("https://relay.example.com", Some("t")).unwrap();

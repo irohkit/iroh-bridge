@@ -121,7 +121,8 @@ export const checks: Check[] = [
     name: "HA: a standby gateway is connected for every backend",
     run: async ({ client }) => {
       // Each backend has a primary (own relay) and a standby (public relays) for failover. The
-      // standby connects in the background, which over the public relays usually takes a second or two but sometimes over ten.
+      // standby connects in the background via the relay iroh.config.ts names for it (well under a
+      // second); without that hint it waits for an address lookup, which sometimes took over ten.
       const allUp = () => client.backends.every((b) => b.replicas.every((r) => r.connected));
       for (let i = 0; i < 80 && !allUp(); i++) await new Promise((r) => setTimeout(r, 250));
       const summary = client.backends.map((b) => {

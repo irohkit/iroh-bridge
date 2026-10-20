@@ -46,8 +46,10 @@ export class IrohClient {
     close(): Promise<any>;
     /**
      * Open the connection to the gateway `remote` now instead of on the first request.
+     * `relay` (also on `request` and `websocket`) is the gateway's relay URL if known: it is
+     * hinted instead of the configured relays, with an address lookup as the fallback.
      */
-    connect(remote: string): Promise<any>;
+    connect(remote: string, relay?: string | null): Promise<any>;
     /**
      * The network paths of the connection to `remote`: `{ kind: "relay" | "direct" | "none",
      * paths: [{ kind, addr, selected, rttMs }] }`, or `null` without a connection.
@@ -77,7 +79,7 @@ export class IrohClient {
      * Resolves to `{ status, headers, body: ReadableStream<Uint8Array> }`; the response body
      * streams in as the backend produces it.
      */
-    request(remote: string, method: string, path: string, headers: any, body: any): Promise<any>;
+    request(remote: string, method: string, path: string, headers: any, body: any, relay?: string | null): Promise<any>;
     /**
      * This client's secret key as hex, to keep its endpoint id across sessions. Treat it like a
      * password: whoever has it can act as this client.
@@ -88,7 +90,7 @@ export class IrohClient {
      * `socket` is set only when the backend accepted the upgrade (status 101); otherwise `body`
      * holds the backend's error response.
      */
-    websocket(remote: string, path: string, headers: any): Promise<any>;
+    websocket(remote: string, path: string, headers: any, relay?: string | null): Promise<any>;
 }
 
 /**
@@ -140,14 +142,14 @@ export interface InitOutput {
     readonly intounderlyingsource_pull: (a: number, b: any) => any;
     readonly irohclient_close: (a: number) => any;
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly irohclient_connect: (a: number, b: number, c: number) => any;
+    readonly irohclient_connect: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly irohclient_connectionInfo: (a: number, b: number, c: number) => [number, number, number];
     readonly irohclient_create: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
     readonly irohclient_endpointId: (a: number) => [number, number];
     readonly irohclient_relayProblem: (a: number) => [number, number];
-    readonly irohclient_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: any, i: any) => any;
+    readonly irohclient_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: any, i: any, j: number, k: number) => any;
     readonly irohclient_secretKey: (a: number) => [number, number];
-    readonly irohclient_websocket: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
+    readonly irohclient_websocket: (a: number, b: number, c: number, d: number, e: number, f: any, g: number, h: number) => any;
     readonly start: () => void;
     readonly websocketconn_close: (a: number, b: number, c: number, d: number) => any;
     readonly websocketconn_recv: (a: number) => any;

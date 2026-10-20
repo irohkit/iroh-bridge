@@ -70,10 +70,12 @@ impl NativeClient {
         serde_json::to_value(info).map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
+    /// `relay` (also on `request` and `websocket`): the gateway's relay URL if known, hinted instead
+    /// of the configured relays (an address lookup is the fallback).
     #[napi]
-    pub fn connect<'e>(&self, env: &'e Env, remote: String) -> NapiResult<PromiseRaw<'e, ()>> {
+    pub fn connect<'e>(&self, env: &'e Env, remote: String, relay: Option<String>) -> NapiResult<PromiseRaw<'e, ()>> {
         let client = self.0.clone();
-        env.spawn_future(async move { client.connect(&remote).await.map_err(err) })
+        env.spawn_future(async move { client.connect(&remote, relay.as_deref()).await.map_err(err) })
     }
 
     /// Sends one request. The body is `bytes`, or what is written to `upload` (streamed).
@@ -88,6 +90,7 @@ impl NativeClient {
         headers: Vec<Vec<String>>,
         bytes: Option<Uint8Array>,
         upload: Option<&NativeUpload>,
+        relay: Option<String>,
     ) -> NapiResult<PromiseRaw<'e, NativeResponse>> {
         let client = self.0.clone();
         // Take the upload first: if anything below fails, dropping it unblocks the JS writer.
@@ -102,18 +105,25 @@ impl NativeClient {
         let headers = pairs(headers)?;
         env.spawn_future(async move {
             let head = RequestHead { method, path, headers, websocket: false };
-            let (resp, body) = client.request(&remote, head, body).await.map_err(err)?;
+            let (resp, body) = client.request(&remote, relay.as_deref(), head, body).await.map_err(err)?;
             Ok(NativeResponse::new(resp, Some(body), None))
         })
     }
 
     /// Opens a WebSocket; `takeSocket()` on the result is set only for status 101.
     #[napi]
-    pub fn websocket<'e>(&self, env: &'e Env, remote: String, path: String, headers: Vec<Vec<String>>) -> NapiResult<PromiseRaw<'e, NativeResponse>> {
+    pub fn websocket<'e>(
+        &self,
+        env: &'e Env,
+        remote: String,
+        path: String,
+        headers: Vec<Vec<String>>,
+        relay: Option<String>,
+    ) -> NapiResult<PromiseRaw<'e, NativeResponse>> {
         let client = self.0.clone();
         let headers = pairs(headers)?;
         env.spawn_future(async move {
-            let (resp, outcome) = client.websocket(&remote, path, headers).await.map_err(err)?;
+            let (resp, outcome) = client.websocket(&remote, relay.as_deref(), path, headers).await.map_err(err)?;
             Ok(match outcome {
                 WsOutcome::Socket(socket) => NativeResponse::new(resp, None, Some(socket)),
                 WsOutcome::Rejected(body) => NativeResponse::new(resp, Some(body), None),

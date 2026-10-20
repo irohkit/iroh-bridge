@@ -63,6 +63,12 @@ export interface IrohFetchOptions {
   relayToken?: string;
   /** Print iroh logs to the console: "error" | "warn" | "info" | "debug" | "trace". */
   logLevel?: string;
+  /**
+   * Node.js only: "native" uses the native addon (direct UDP paths via hole punching, relay as
+   * fallback), "wasm" the WASM build (always through a relay). Default "auto": native when a
+   * prebuild for the platform is installed, else WASM. Overrides the `IROH_FETCH_BACKEND` env var.
+   */
+  engine?: "auto" | "native" | "wasm";
   /** Dial the gateway immediately (default true). If false, the first request dials. */
   connect?: boolean;
   /**
@@ -184,7 +190,20 @@ export interface IrohFetch {
   cookies: IrohCookies;
   /** This client's own iroh endpoint id (the backend sees it as `X-Iroh-Remote-Id`). */
   endpointId: string;
+  /** Node.js only: the client implementation in use (see the `engine` option). */
+  engine?: "native" | "wasm";
+  /**
+   * Node.js only: how this client reaches a gateway (default: the first configured one) right now,
+   * or null without a connection. `kind` is the selected path's: "direct" once hole punching
+   * succeeded, else "relay".
+   */
+  connectionInfo?(endpointId?: string): ConnectionInfo | null;
   close(): Promise<void>;
+}
+
+export interface ConnectionInfo {
+  kind: "direct" | "relay" | "none";
+  paths: Array<{ kind: "direct" | "relay" | "custom"; addr: string; selected: boolean; rttMs: number }>;
 }
 
 export function createIrohFetch(options: IrohFetchOptions): Promise<IrohFetch>;

@@ -52,6 +52,7 @@
   },
   "scripts": {
     "build": "../../scripts/build-wasm.sh",
+    "build:native": "../../scripts/build-native.sh",
     "test": "node --test test/*.test.js"
   },
   "keywords": [

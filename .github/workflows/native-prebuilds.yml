@@ -1,0 +1,66 @@
+name: native-prebuilds
+
+# Builds the native Node.js addon (crates/node-client) for every platform iroh-fetch ships a
+# prebuild for, and uploads each as an artifact named native-<platform>. Called by publish-npm.yml;
+# can also be run by hand to check all platforms still build.
+on:
+  workflow_call:
+  workflow_dispatch:
+  # Also on pull requests that touch the Rust client, so every platform is known to build before
+  # a release needs it.
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/native-prebuilds.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.tag }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 (glibc 2.35) so the addon also loads on older distributions.
+          - { tag: linux-x64-gnu, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { tag: linux-arm64-gnu, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { tag: linux-x64-musl, os: ubuntu-latest, target: x86_64-unknown-linux-musl, container: "rust:1-alpine" }
+          - { tag: darwin-x64, os: macos-latest, target: x86_64-apple-darwin }
+          - { tag: darwin-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { tag: win32-x64-msvc, os: windows-latest, target: x86_64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build tools (Alpine)
+        if: matrix.container
+        shell: sh
+        run: apk add --no-cache bash build-base nodejs git
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.container }}
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.target }}
+      - name: Build
+        # musl links statically by default, which rules out a cdylib; Node loads it dynamically.
+        env:
+          RUSTFLAGS: ${{ matrix.container && '-C target-feature=-crt-static' || '' }}
+        run: bash scripts/build-native.sh ${{ matrix.target }} ${{ matrix.tag }} prebuilds
+      - name: Smoke test
+        # The macOS runner is arm64, so the x64 build can't be loaded there.
+        if: matrix.tag != 'darwin-x64'
+        run: node -e "const m = require('./prebuilds/iroh-fetch.${{ matrix.tag }}.node'); if (typeof m.createClient !== 'function') process.exit(1); console.log(Object.keys(m).join(' '))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.tag }}
+          path: prebuilds/iroh-fetch.${{ matrix.tag }}.node
+          if-no-files-found: error

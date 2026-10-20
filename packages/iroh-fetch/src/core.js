@@ -37,8 +37,10 @@ export function makeCreate(init) {
     const single = !options?.backends;
     const backends = parseBackends(options);
     const httpCache = createHttpCache(options?.cache);
-    await init();
-    if (logLevel) enableLogging(logLevel);
+    // init may hand back another client implementation (Node.js: the native addon); else WASM.
+    const backend = await init(options);
+    const impl = typeof backend?.IrohClient === "function" ? backend : { IrohClient, enableLogging };
+    if (logLevel) impl.enableLogging(logLevel);
     // One local endpoint serves every gateway; each gateway gets its own connection.
     if (relayToken && !relayUrl) throw new Error("iroh-fetch: relayToken needs relayUrl");
     // A fixed identity lets gateways allow-list or rate-limit this client by endpoint id.
@@ -50,7 +52,7 @@ export function makeCreate(init) {
     } catch {}
     // Several relays (e.g. your own plus "n0" as a fallback) arrive as one comma-separated list.
     const relays = Array.isArray(relayUrl) ? relayUrl.join(",") : relayUrl;
-    const client = await IrohClient.create(relays || undefined, relayToken ?? undefined, secretKey ?? storedKey ?? undefined);
+    const client = await impl.IrohClient.create(relays || undefined, relayToken ?? undefined, secretKey ?? storedKey ?? undefined);
     if (idStore && !storedKey && !secretKey) {
       try {
         idStore.setItem(idKey, client.secretKey());

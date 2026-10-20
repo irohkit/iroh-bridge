@@ -403,6 +403,33 @@ The same package works in Node.js ≥ 22 (`import { createIrohFetch } from "iroh
 serverless functions, keep the client in a module-level variable so warm invocations reuse the connection (a cold start
 connects in about a second).
 
+**Native engine: direct connections.** Browsers can't send UDP, so the WASM client always goes through a relay. In
+Node.js, iroh-fetch instead loads a native addon (the same Rust client, built with napi-rs) when a prebuild for the
+platform is installed: linux x64/arm64 (glibc), linux x64 (musl, e.g. Alpine), macOS x64/arm64 and Windows x64. npm
+installs the matching `iroh-fetch-<platform>` package automatically as an optional dependency. The native client has
+real UDP sockets, so it starts over the relay like the browser does, then hole-punches a direct path to the gateway and
+moves the connection there within about a second. Where hole punching fails (e.g. both sides behind symmetric NATs), it
+simply stays on the relay. On other platforms, or if the addon can't be loaded, the WASM engine is used without a word.
+
+```ts
+const iroh = await createIrohFetch({ endpointId, engine: "native" }); // "auto" (default) | "native" | "wasm"
+iroh.engine;           // "native" or "wasm": what is in use
+iroh.connectionInfo(); // { kind: "direct", paths: [{ kind: "direct", addr: "203.0.113.7:51820", rttMs: 3.1, ... }, ...] }
+```
+
+`engine: "native"` fails if the addon can't be loaded instead of falling back; the `IROH_FETCH_BACKEND=native|wasm`
+environment variable does the same without code changes (the option wins over it).
+
+Measured against one demo gateway with [`scripts/bench-engines.mjs`](scripts/bench-engines.mjs) (Node 24, 500
+sequential `GET /hello`, 30 MB streamed `POST /upload`, own relay on a VPS ~20 ms away). **Note:** the gateway ran on the
+same machine as the client, so the native engine's direct path here is a host-local hop (RTT ~0.2 ms); across the internet
+expect the network's RTT instead of the relay detour, not these absolute numbers.
+
+| Engine | Path | First response | Latency p50 | p99 | Upload |
+|---|---|---|---|---|---|
+| native | direct (host-local) | 75 ms | 0.56 ms | 1.5–2.1 ms | 210–230 MB/s |
+| WASM | relay | 90–165 ms | 14 ms | 16 ms | 9.2 MB/s |
+
 ### Options reference
 
 | Option | Default | |
@@ -421,10 +448,12 @@ connects in about a second).
 | `secretKey` | random | fixed client identity (64 hex chars) |
 | `persistIdentity` | `false` | keep the identity in localStorage (`true`) or a `Storage` |
 | `logLevel` | off | `"info"`, `"debug"`, ... iroh logs in the console |
+| `engine` | `"auto"` | Node.js only: `"native"` (direct UDP paths) or `"wasm"` (always via relay); see [Node.js](#nodejs) |
 
 The client object: `fetch`, `XMLHttpRequest`, `EventSource`, `WebSocket`, `websocket(url, { protocols, headers })`,
 `install(opts)`, `serviceWorker(opts)`, `proxyUrl(url)`, `objectUrl(url, init)`, `backend(origin)`, `backends`, `cookies`, `endpointId` (this
-client's id, which the backend sees as `X-Iroh-Remote-Id`), `exportSecretKey()`, `clearCache()`, `close()`.
+client's id, which the backend sees as `X-Iroh-Remote-Id`), `exportSecretKey()`, `clearCache()`, `close()`, and in
+Node.js `engine` and `connectionInfo(endpointId?)`.
 
 ## Backend: `iroh-gateway`
 
@@ -632,6 +661,8 @@ Leave both unset to stay on the public relays.
   where they fit.
 - **Latency and throughput**: browsers can't send UDP, so the browser side always goes through a relay. Through n0's public
   relays we measured about 70–120 ms per request and 1–3.5 MB/s for uploads. A relay close to your users does better.
+  Node.js on a platform with a prebuild uses the [native engine](#nodejs) and usually connects directly (UDP must be
+  allowed outbound), relying on the relay only to set the connection up.
 - **WASM size**: ~3.4 MB (~1.4 MB gzipped), cached after the first load. Load it lazily (the React provider does).
 
 ## Troubleshooting
@@ -646,7 +677,9 @@ Leave both unset to stay on the public relays.
 
 ```
 crates/gateway     iroh-gateway (Rust)
-crates/web-client  the iroh client compiled to WASM
+crates/client-core the iroh client itself (connections, dialing, streaming), shared by:
+crates/web-client  its WASM build (browsers, and Node.js without the native addon)
+crates/node-client its native Node.js addon (napi-rs)
 crates/proto       wire format: one request or WebSocket per QUIC stream
 packages/iroh-fetch npm package (JS API, React bindings, iroh-proxy CLI, tests)
 examples/nextjs    demo app with a self-test (deployed to Vercel)
@@ -661,19 +694,28 @@ Build the WASM (needs Rust with `wasm32-unknown-unknown`, `clang`, `wasm-bindgen
 ./scripts/build-wasm.sh
 ```
 
+Build the native addon for this machine into `packages/iroh-fetch/native/`, where iroh-fetch looks before the prebuild
+packages (plain `cargo`, no `@napi-rs/cli`; pass a Rust target and platform tag to cross-build):
+
+```bash
+./scripts/build-native.sh
+```
+
 Run the end-to-end tests against running gateways in front of `examples/backend` (A on two gateways, B on one), the
 browser self-test, and the load test:
 
 ```bash
 cd packages/iroh-fetch
 IROH_ENDPOINT_ID=<A1> IROH_ENDPOINT_ID_A2=<A2> IROH_ENDPOINT_ID_B=<B> npm test
-# add IROH_RELAY_URL / IROH_RELAY_TOKEN when the gateways use your own relay
+# add IROH_RELAY_URL / IROH_RELAY_TOKEN when the gateways use your own relay;
+# IROH_FETCH_BACKEND=native or =wasm runs the suite on one engine (CI runs both)
 python3 scripts/browser-test.py https://your-demo.example.com/
 node scripts/loadtest.mjs --help
 ```
 
 **Releasing**: bump `packages/iroh-fetch/package.json`, commit, and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`).
-CI then publishes to npm (trusted publishing, no token in the repo), attaches gateway binaries to the GitHub release
+CI then publishes to npm (trusted publishing, no token in the repo): first the six `iroh-fetch-<platform>` native addon
+packages built by `native-prebuilds.yml`, then `iroh-fetch` pinning them as optional dependencies. It also attaches gateway binaries to the GitHub release
 and pushes the Docker image.
 
 ## License

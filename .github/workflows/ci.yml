@@ -28,6 +28,15 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 24
-      - name: Load test
+      - name: Build native addon (linux-x64-gnu)
+        run: ./scripts/build-native.sh
+      - name: Test with WASM
         working-directory: packages/iroh-fetch
         run: npm test
+        env:
+          IROH_FETCH_BACKEND: wasm
+      - name: Test with the native addon
+        working-directory: packages/iroh-fetch
+        run: npm test
+        env:
+          IROH_FETCH_BACKEND: native

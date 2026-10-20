@@ -1,0 +1,26 @@
+[package]
+name = "node-client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/irohkit/iroh-bridge"
+description = "Native Node.js addon for iroh-fetch: the same client as the WASM build, plus UDP and hole punching"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+client-core = { path = "../client-core" }
+# The default features add port mapping (UPnP, NAT-PMP, PCP), which helps direct paths.
+iroh = { workspace = true, default-features = true }
+anyhow.workspace = true
+serde_json.workspace = true
+napi = { version = "3", features = ["napi8", "tokio_rt", "serde-json"] }
+napi-derive = "3"
+n0-future = "0.3"
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+napi-build = "2"

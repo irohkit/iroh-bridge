@@ -49,6 +49,11 @@ export class IrohClient {
      */
     connect(remote: string): Promise<any>;
     /**
+     * The network paths of the connection to `remote`: `{ kind: "relay" | "direct" | "none",
+     * paths: [{ kind, addr, selected, rttMs }] }`, or `null` without a connection.
+     */
+    connectionInfo(remote: string): any;
+    /**
      * Create a local endpoint that can talk to any number of gateways.
      * `relay_url` must match the gateways' relay if they use a custom one; `relay_token` is
      * for relays that only admit clients with a token.
@@ -133,9 +138,10 @@ export interface InitOutput {
     readonly intounderlyingsink_write: (a: number, b: any) => any;
     readonly intounderlyingsource_cancel: (a: number) => void;
     readonly intounderlyingsource_pull: (a: number, b: any) => any;
-    readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly irohclient_close: (a: number) => any;
+    readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly irohclient_connect: (a: number, b: number, c: number) => any;
+    readonly irohclient_connectionInfo: (a: number, b: number, c: number) => [number, number, number];
     readonly irohclient_create: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
     readonly irohclient_endpointId: (a: number) => [number, number];
     readonly irohclient_relayProblem: (a: number) => [number, number];
@@ -150,8 +156,8 @@ export interface InitOutput {
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___js_sys_7533570554f6805f___Function_fn_wasm_bindgen_e1363021040f656a___JsValue_____wasm_bindgen_e1363021040f656a___sys__Undefined___js_sys_7533570554f6805f___Function_fn_wasm_bindgen_e1363021040f656a___JsValue_____wasm_bindgen_e1363021040f656a___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_e1363021040f656a___JsError___true_: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true_: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__27: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__28: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__29: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke_______true_: (a: number, b: number) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke_______true__1_: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;

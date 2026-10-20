@@ -40,6 +40,7 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
   - [Access control](#access-control)
   - [What your backend sees](#what-your-backend-sees)
 - [Local port: `iroh-proxy`](#local-port-iroh-proxy)
+- [Run your own relay](#run-your-own-relay)
 - [Production notes](#production-notes)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -394,11 +395,48 @@ HTTP (streaming both ways), redirects and cookies are passed through untouched, 
 your browser (DNS rebinding, cross-site requests) it only accepts `Host: localhost`/IP and same-origin `Origin` headers.
 Add exceptions with `--allow-host` and `--allow-origin`.
 
+## Run your own relay
+
+Browsers can't send UDP, so every browser request goes through a relay. n0's public relays work out of the box, but your
+own relay close to your users is the biggest speed-up you can get, and it removes a shared dependency.
+
+Measured with the test suite: through n0's public relay a request took about 70 ms and a 20 MB upload 18 s; through a
+self-hosted relay (on the same machine, so a best case) about 5–10 ms and 1.2 s. On a VPS near your users, expect
+something in between, dominated by the round trip to the VPS.
+
+**On a VPS** with a public IP and a DNS name (e.g. `relay.example.com`), open 80/tcp, 443/tcp and 7842/udp, then:
+
+```bash
+sudo ./deploy/relay/install.sh relay.example.com you@example.com
+```
+
+That installs `iroh-relay` (via `cargo install iroh-relay --features server` if needed), writes
+[`deploy/relay/iroh-relay.toml`](deploy/relay/iroh-relay.toml) to `/etc/iroh-relay/`, gets a Let's Encrypt certificate
+automatically, and runs it as a sandboxed systemd service ([`deploy/relay/iroh-relay.service`](deploy/relay/iroh-relay.service))
+with per-client rate limits.
+
+**Use it** on every gateway and in the frontend (both sides must use the same relay):
+
+```bash
+IROH_RELAY_URL=https://relay.example.com iroh-gateway
+```
+
+```ts
+createIrohFetch({ relayUrl: "https://relay.example.com", backends: { ... } });
+// React: <IrohProvider relayUrl="https://relay.example.com" ...>
+// Next.js example: NEXT_PUBLIC_IROH_RELAY_URL=https://relay.example.com
+```
+
+For local development, `iroh-relay --dev` serves plain HTTP on port 3340 (`relayUrl: "http://127.0.0.1:3340"`).
+
+Relays only forward end-to-end encrypted packets; they can't read or change traffic. You can still restrict who may use
+yours with `access` in the config (an allow-list, a deny-list, a shared token, or an HTTP callback). Browsers get a new
+endpoint id each session, so for public web apps leave it open and rely on the rate limits.
+
 ## Production notes
 
-- **Run your own relay**: n0's public relays are fine for development but have no SLA and may be rate limited. Run
-  [`iroh-relay`](https://docs.iroh.computer/) on a VPS with a domain and TLS, and set the same URL as `IROH_RELAY_URL` on
-  the gateways and `relayUrl` on the client, or use n0's hosted relay service.
+- **Run your own relay**: n0's public relays are fine for development but have no SLA and may be rate limited. See
+  [Run your own relay](#run-your-own-relay), or use n0's hosted relay service.
 - **Security**: traffic is end-to-end encrypted with QUIC/TLS, and the relay can't read it. Anyone who knows an endpoint id
   can reach that gateway, just like a public URL, so keep authenticating in your backend, and use the gateway's allow-lists
   where they fit.
@@ -423,7 +461,7 @@ crates/proto       wire format: one request or WebSocket per QUIC stream
 packages/iroh-fetch npm package (JS API, React bindings, iroh-proxy CLI, tests)
 examples/nextjs    demo app with a self-test (deployed to Vercel)
 examples/backend   mock backend used by the demo and tests
-deploy/            systemd unit, install script, Docker
+deploy/            systemd unit, install script, Docker, relay setup
 ```
 
 Build the WASM (needs Rust with `wasm32-unknown-unknown`, `clang`, `wasm-bindgen-cli` matching `Cargo.lock`, optionally

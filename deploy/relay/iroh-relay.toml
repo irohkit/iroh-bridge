@@ -1,0 +1,37 @@
+# Configuration for your own iroh relay (iroh-relay 1.3). Installed to /etc/iroh-relay/iroh-relay.toml
+# by deploy/relay/install.sh, which fills in the hostname and contact email.
+#
+# Needs a public IP, a DNS name pointing at it, and these ports open:
+#   443/tcp  HTTPS + WebSocket relay (browsers connect here) and Let's Encrypt (TLS-ALPN)
+#   80/tcp   plain HTTP (captive-portal checks)
+#   7842/udp QUIC address discovery (helps native clients find direct paths)
+
+enable_relay = true
+http_bind_addr = "[::]:80"
+enable_quic_addr_discovery = true
+
+# Metrics stay on localhost; scrape them through an SSH tunnel or a local agent.
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+
+# Anyone may relay, like n0's public relays. Traffic is end-to-end encrypted, so the relay only
+# forwards opaque packets. Lock it down with `access.allowlist = ["<endpoint id>", ...]` when every
+# client has a fixed id (servers, iroh-proxy); browsers get a new id per session.
+access = "everyone"
+
+[tls]
+cert_mode = "LetsEncrypt"
+hostname = ["relay.example.com"]
+contact = "admin@example.com"
+cert_dir = "/var/lib/iroh-relay/certs"
+https_bind_addr = "[::]:443"
+quic_bind_addr = "[::]:7842"
+
+# Keep one abusive client from saturating the relay. Generous for normal browser use.
+[limits]
+accept_conn_limit = 50.0
+accept_conn_burst = 200
+
+[limits.client.rx]
+bytes_per_second = 10485760  # 10 MiB/s per client
+max_burst_bytes = 20971520   # 20 MiB

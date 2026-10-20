@@ -512,6 +512,15 @@ fn for_log(s: &str) -> String {
     format!("{:?}{ellipsis}", &s[..end])
 }
 
+/// A request path for the log, without its query string: queries often carry secrets
+/// (`?access_token=`, signed URLs, API keys) that must not end up in log files.
+fn path_for_log(path: &str) -> String {
+    match path.split_once('?') {
+        Some((p, _)) => format!("{}?…", for_log(p).trim_matches('"')),
+        None => for_log(path).trim_matches('"').to_string(),
+    }
+}
+
 /// The backends a request may go to, with passive health tracking: an upstream is only judged
 /// by whether it accepts connections, since any HTTP answer (even a 5xx) is the app's own reply.
 struct Upstreams {
@@ -630,7 +639,7 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mu
         }
     };
     if let Err(reason) = validate_head(&head) {
-        info!("{} {} -> 400 ({reason})", for_log(&head.method), for_log(&head.path));
+        info!("{} {} -> 400 ({reason})", for_log(&head.method), path_for_log(&head.path));
         return respond_text(ctx, send, 400, &format!("bad request: {reason}")).await;
     }
     // From here on method, path and headers are known to be printable, so they can be logged as-is.
@@ -640,11 +649,11 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mu
     // Routing and the allow list both look at the validated path. WebSockets get the same
     // checks, before any upstream is contacted.
     if !ctx.allow_paths.is_empty() && !ctx.allow_paths.iter().any(|p| prefix_matches(p, path)) {
-        info!("{method} {} -> 403 (path not allowed)", head.path);
+        info!("{method} {} -> 403 (path not allowed)", path_for_log(&head.path));
         return respond_text(ctx, send, 403, "forbidden").await;
     }
     let Some((route, upstreams)) = ctx.router.select(host.as_deref().map(normalize_host).as_deref(), path) else {
-        info!("{method} {} -> 404 (no route for host {})", head.path, host.as_deref().unwrap_or("-"));
+        info!("{method} {} -> 404 (no route for host {})", path_for_log(&head.path), host.as_deref().unwrap_or("-"));
         return respond_text(ctx, send, 404, "no route for this host or path").await;
     };
     head.headers = proxy_headers(head.headers, remote, host.as_deref());
@@ -655,7 +664,7 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mu
     let body = match with_limit(ctx.body_idle_timeout, recv.read_chunk(CHUNK_SIZE)).await {
         Some(first) => request_body(recv, first?, ctx.max_body, ctx.body_idle_timeout, upload.clone()),
         None => {
-            info!("{} {} -> 408 (no request body received)", head.method, head.path);
+            info!("{} {} -> 408 (no request body received)", head.method, path_for_log(&head.path));
             return respond_text(ctx, send, 408, "request body timeout").await;
         }
     };
@@ -666,7 +675,7 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mu
     let answer = tokio::select! {
         answer = upstream_deadline(forward_any(ctx, upstreams, &head, body), ctx.upstream_timeout, &upload) => answer,
         _ = client_gone => {
-            info!("{} {} -> client went away while waiting for the backend", head.method, head.path);
+            info!("{} {} -> client went away while waiting for the backend", head.method, path_for_log(&head.path));
             return Ok(());
         }
     };
@@ -678,15 +687,15 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mu
                 Some(failure) => failure,
                 None => (502, "bad gateway"),
             };
-            warn!("{} {} -> {status} (route {route}): {err:#}", head.method, head.path);
+            warn!("{} {} -> {status} (route {route}): {err:#}", head.method, path_for_log(&head.path));
             return respond_text(ctx, send, status, text).await;
         }
         None => {
-            warn!("{} {} -> 504: backend did not answer in time (route {route})", head.method, head.path);
+            warn!("{} {} -> 504: backend did not answer in time (route {route})", head.method, path_for_log(&head.path));
             return respond_text(ctx, send, 504, "gateway timeout").await;
         }
     };
-    info!("{} {} -> {} via {upstream} (route {route})", head.method, head.path, resp.status().as_u16());
+    info!("{} {} -> {} via {upstream} (route {route})", head.method, path_for_log(&head.path), resp.status().as_u16());
 
     let mut headers = header_pairs(resp.headers());
     headers.push(("x-iroh-gateway-id".into(), ctx.gateway_id.clone()));
@@ -802,11 +811,11 @@ async fn handle_websocket(
             // details stay in the log.
             let (status, headers, body) = match err {
                 tungstenite::Error::Http(resp) => {
-                    warn!("WS {} -> {} via {upstream} (route {route})", head.path, resp.status().as_u16());
+                    warn!("WS {} -> {} via {upstream} (route {route})", path_for_log(&head.path), resp.status().as_u16());
                     (resp.status().as_u16(), header_pairs(resp.headers()), resp.body().clone().unwrap_or_default())
                 }
                 err => {
-                    warn!("WS {} -> 502 via {upstream} (route {route}): {err}", head.path);
+                    warn!("WS {} -> 502 via {upstream} (route {route}): {err}", path_for_log(&head.path));
                     (502, vec![("content-type".into(), "text/plain".into())], b"bad gateway".to_vec())
                 }
             };
@@ -816,7 +825,7 @@ async fn handle_websocket(
             return Ok(());
         }
     };
-    info!("WS {} -> 101 via {upstream} (route {route})", head.path);
+    info!("WS {} -> 101 via {upstream} (route {route})", path_for_log(&head.path));
     let headers = header_pairs(resp.headers())
         .into_iter()
         .filter(|(k, _)| !WS_HANDSHAKE_HEADERS.contains(&k.as_str()))
@@ -1129,6 +1138,12 @@ fn check_key_permissions(_file: &std::fs::File, _path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_paths_drop_query_strings() {
+        assert_eq!(super::path_for_log("/ws-auth?access_token=eyJ.secret"), "/ws-auth?…");
+        assert_eq!(super::path_for_log("/hello"), "/hello");
+    }
+
     use super::*;
 
     fn head(method: &str, path: &str, headers: &[(&str, &str)]) -> RequestHead {

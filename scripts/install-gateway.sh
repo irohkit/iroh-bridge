@@ -157,8 +157,9 @@ say "downloaded $asset.tar.gz"
 get "$BASE_URL/$VERSION/$asset.tar.gz.sha256" "$tmp/$asset.tar.gz.sha256" || die "could not download $asset.tar.gz.sha256"
 expected=$(cut -d' ' -f1 < "$tmp/$asset.tar.gz.sha256" | tr -d '\r\n')
 actual=$(sha256 "$tmp/$asset.tar.gz")
-[ -n "$expected" ] && [ "$expected" = "$actual" ] \
-  || die "checksum mismatch for $asset.tar.gz: expected $expected, got $actual"
+if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+  die "checksum mismatch for $asset.tar.gz: expected $expected, got $actual"
+fi
 say "sha256 verified"
 
 mkdir "$tmp/x"
@@ -180,8 +181,9 @@ if [ -n "$SYSTEMD_BACKEND" ]; then
       || get "$RAW_URL/$ref/deploy/iroh-gateway.service" "$tmp/repo/deploy/iroh-gateway.service" || continue
     break
   done
-  [ -s "$tmp/repo/deploy/install.sh" ] && [ -s "$tmp/repo/deploy/iroh-gateway.service" ] \
-    || die "could not download deploy/install.sh and deploy/iroh-gateway.service from $RAW_URL"
+  if [ ! -s "$tmp/repo/deploy/install.sh" ] || [ ! -s "$tmp/repo/deploy/iroh-gateway.service" ]; then
+    die "could not download deploy/install.sh and deploy/iroh-gateway.service from $RAW_URL"
+  fi
   say "installing the systemd service (backend $SYSTEMD_BACKEND)"
   bash "$tmp/repo/deploy/install.sh" "$SYSTEMD_BACKEND" "$bin"
   say ""

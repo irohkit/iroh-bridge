@@ -66,7 +66,7 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
 | **Many backends** | one frontend, any number of backends, routed by origin over one shared connection |
 | **High availability** | several gateways per backend with `failover` or `round-robin`; several upstreams per gateway with health checks |
 | **Gateway routing** | one gateway can serve many internal services by host and path prefix |
-| **Access control** | allow-list client endpoint ids and paths at the gateway |
+| **Access control** | allow-list client endpoint ids and paths, rate-limit each client at the gateway |
 | **Hardened** | strict path and header validation, limits and timeouts against slow or flooding clients, no error leaks, sandboxed service; checked by attacking test gateways |
 | **Trustworthy caller identity** | the backend gets `X-Iroh-Remote-Id`, the caller's cryptographically verified endpoint id |
 | **Stable client identity** | optional fixed endpoint id per device or server (`persistIdentity`, `secretKey`) for allow-lists and rate limits |
@@ -479,6 +479,10 @@ needs outbound UDP/HTTPS, and no inbound port.
 | `IROH_ROUTES` / `--route` | | host/path routing, see below |
 | `IROH_ALLOW_CLIENTS` / `--allow-client` | everyone | allowed client endpoint ids |
 | `IROH_ALLOW_PATHS` / `--allow-path` | everything | allowed path prefixes |
+| `IROH_RATE_LIMIT` / `--rate-limit` | off | requests per second per client endpoint id, 429 beyond ([below](#rate-limits-per-client)) |
+| `IROH_RATE_BURST` / `--rate-burst` | 2 × rate, at least 1 | requests a client may make at once before the rate applies |
+| `IROH_MAX_CONNECTIONS_PER_CLIENT` / `--max-connections-per-client` | off | open connections per client endpoint id |
+| `IROH_RATE_LIMIT_EXEMPT` / `--rate-limit-exempt` | | endpoint ids the per-client limits don't apply to |
 | `IROH_KEY_FILE` / `--key-file` | `iroh-gateway.key` | secret key (created on first run) |
 | `IROH_RELAY_URL` / `--relay-url` | n0 public relays | your own relay ([guide](deploy/relay/README.md)) |
 | `IROH_RELAY_TOKEN` / `--relay-token` | | token for a relay that requires one |
@@ -527,10 +531,41 @@ Client endpoint ids are random per browser session unless you give the client a 
 mostly useful for server-to-server use (Node, `iroh-proxy`). For browser users, authenticate in your backend as you would
 on a public URL (sessions, tokens). `X-Iroh-Remote-Id` gives you a verified id to rate-limit or audit by.
 
+#### Rate limits per client
+
+Anyone who knows the gateway's endpoint id can call it, like a public URL. Besides the global limits, the gateway can
+limit each client, keyed by the same verified endpoint id the backend sees as `X-Iroh-Remote-Id`:
+
+```bash
+IROH_RATE_LIMIT=10                     # sustained requests per second per client (fractions like 0.5 work)
+IROH_RATE_BURST=20                     # how many may come at once (default: twice the rate, at least 1)
+IROH_MAX_CONNECTIONS_PER_CLIENT=4      # further connections from the same id are refused
+IROH_RATE_LIMIT_EXEMPT=<endpoint id>   # e.g. your own servers; comma-separated
+```
+
+- It is a token bucket per client: a client may send `IROH_RATE_BURST` requests at once, then `IROH_RATE_LIMIT` per
+  second. A WebSocket upgrade counts as one request; messages on an open WebSocket don't count.
+- A request over the limit gets `429 Too Many Requests` with `retry-after` (seconds) straight from the gateway, before
+  its head is even read, so it costs no request slot and never reaches the backend. It is counted as
+  `iroh_gateway_rejected_total{reason="rate_limited"}`, and a refused connection as `reason="client_connection_limit"`.
+  The log shows at most one line per 10 seconds for each, so a flood can't flood the log.
+- Memory stays bounded. A bucket that has refilled completely holds no information and is dropped (swept every
+  minute), and at most 16384 clients are tracked (`iroh_gateway_rate_limit_tracked_clients`). When the table is full
+  of clients that are all still being limited, new clients share a single overflow bucket instead of pushing anyone
+  out: endpoint ids cost nothing to make, so evicting would let a flood of fresh ids reset the limits of the clients
+  being throttled. A flood of new ids then gets one client's allowance in total, and clients already tracked are
+  unaffected, at the cost of genuinely new clients being throttled together until room frees up.
+- Per-id limits stop a single misbehaving client (a buggy retry loop, a scraper), not someone who generates new ids;
+  the global limits (`IROH_MAX_CONNECTIONS`, `IROH_MAX_REQUESTS`) and `IROH_ALLOW_CLIENTS` remain the defence against
+  that. Browser clients get a new id per session unless they use a fixed key.
+- All four settings reload with the config file below. A lower connection limit applies to new connections; open ones
+  stay up.
+
 ### Changing routes and allow lists without a restart
 
 Put the settings you want to change at runtime in a file and point `IROH_CONFIG_FILE` at it. It uses the systemd
-`EnvironmentFile` format, so the same file can hold the gateway's other variables too (only these four are reloaded):
+`EnvironmentFile` format, so the same file can hold the gateway's other variables too (only these keys and the
+[per-client rate limits](#rate-limits-per-client) are reloaded):
 
 ```bash
 # /etc/iroh-gateway.env
@@ -538,13 +573,17 @@ BACKEND_URL=http://127.0.0.1:8080
 IROH_ROUTES="api.example.com=http://127.0.0.1:8080;/admin=http://127.0.0.1:9100"
 IROH_ALLOW_CLIENTS=
 IROH_ALLOW_PATHS=
+IROH_RATE_LIMIT=10
+IROH_RATE_BURST=
+IROH_MAX_CONNECTIONS_PER_CLIENT=
+IROH_RATE_LIMIT_EXEMPT=
 ```
 
 Edit it, then send `SIGHUP`: `systemctl reload iroh-gateway` (the shipped unit has `ExecReload`), or
 `docker kill -s HUP <container>`. Open connections stay up, requests in flight finish on the config they started
 with, and new requests use the new one. A client removed from `IROH_ALLOW_CLIENTS` is disconnected on its next request.
 A file with an error is rejected as a whole; the gateway logs why and keeps running the previous config. Values in the
-file override flags and environment; a key left out of the file falls back to them. Upstream health and per-route
+file override flags and environment (an empty value means unset); a key left out of the file falls back to them. Upstream health and per-route
 counters start fresh for the reloaded routes; `iroh_gateway_config_reloads_total{result="ok"|"error"}` counts reloads.
 
 ### Monitoring
@@ -559,8 +598,8 @@ IROH_ADMIN_ADDR=127.0.0.1:9180 iroh-gateway
 |---|---|
 | `GET /healthz` | `200 ok` once the gateway is online on its relay (for systemd/Docker/Kubernetes health checks) |
 | `GET /readyz` | `200` when every route has a healthy upstream, else `503` listing the unhealthy ones |
-| `GET /status` | JSON: endpoint id, version, uptime, relay status, connections, in-flight requests, upstream health |
-| `GET /metrics` | Prometheus: requests by route and status class, WebSocket upgrades, upstream failures and health, rejections by reason, connections, in-flight requests, request duration histogram |
+| `GET /status` | JSON: endpoint id, version, uptime, relay status, connections, in-flight requests, rate limits, upstream health |
+| `GET /metrics` | Prometheus: requests by route and status class, WebSocket upgrades, upstream failures and health, rejections by reason (including `rate_limited`), connections, in-flight requests, rate-limited clients tracked, request duration histogram |
 
 It only binds loopback addresses unless you add `--admin-allow-public` (it has no authentication). Labels never contain
 request paths or queries.

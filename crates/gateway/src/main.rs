@@ -105,6 +105,22 @@ struct Args {
     /// requests get 503.
     #[arg(long, env = "IROH_MAX_REQUESTS", default_value_t = 8192)]
     max_requests: usize,
+    /// Sustained requests per second each client (by its verified endpoint id) may make; above
+    /// it requests get 429 with `retry-after`. Fractions like 0.5 work. 0 = no limit.
+    #[arg(long, env = "IROH_RATE_LIMIT", default_value_t = 0.0, value_name = "PER_SEC")]
+    rate_limit: f64,
+    /// How many requests a client may make at once before --rate-limit applies.
+    /// [default: twice the rate, at least 1]
+    #[arg(long, env = "IROH_RATE_BURST", value_name = "REQUESTS")]
+    rate_burst: Option<u32>,
+    /// Maximum number of connections one client (endpoint id) may have open; further ones are
+    /// refused. 0 = no limit.
+    #[arg(long, env = "IROH_MAX_CONNECTIONS_PER_CLIENT", default_value_t = 0)]
+    max_connections_per_client: usize,
+    /// Endpoint ids (comma-separated) that neither --rate-limit nor
+    /// --max-connections-per-client apply to, e.g. your own servers.
+    #[arg(long = "rate-limit-exempt", env = "IROH_RATE_LIMIT_EXEMPT", value_delimiter = ',', value_name = "ENDPOINT_ID")]
+    rate_limit_exempt: Vec<String>,
     /// How long a client may take to send a request head once it opened the stream (0 = no limit).
     #[arg(long, env = "HEAD_TIMEOUT_SECS", default_value_t = 10)]
     head_timeout_secs: u64,
@@ -120,8 +136,9 @@ struct Args {
     #[arg(long, env = "UPSTREAM_TIMEOUT_SECS", default_value_t = 300)]
     upstream_timeout_secs: u64,
     /// File with settings that can be changed without a restart: BACKEND_URL, IROH_ROUTES,
-    /// IROH_ALLOW_CLIENTS and IROH_ALLOW_PATHS as `KEY=value` lines (systemd EnvironmentFile
-    /// format; other keys are ignored). Its values override the flags and environment. Re-read on
+    /// IROH_ALLOW_CLIENTS, IROH_ALLOW_PATHS, IROH_RATE_LIMIT, IROH_RATE_BURST,
+    /// IROH_MAX_CONNECTIONS_PER_CLIENT and IROH_RATE_LIMIT_EXEMPT as `KEY=value` lines (systemd
+    /// EnvironmentFile format; other keys are ignored). Its values override the flags and environment. Re-read on
     /// SIGHUP (`systemctl reload`); a file with errors is rejected and the running config kept.
     #[arg(long, env = "IROH_CONFIG_FILE", value_name = "PATH")]
     config_file: Option<PathBuf>,
@@ -208,6 +225,10 @@ async fn main() -> Result<()> {
         upstream_connect_timeout,
         upstream_timeout: limit_secs(args.upstream_timeout_secs),
         busy_log: LogThrottle::default(),
+        rate_limiter: RateLimiter::new(RATE_MAX_CLIENTS),
+        client_connections: ClientConnections::default(),
+        rate_log: LogThrottle::default(),
+        client_connections_log: LogThrottle::default(),
         metrics: Metrics::default(),
     });
 
@@ -312,6 +333,12 @@ struct Policy {
     allow_clients: HashSet<EndpointId>,
     /// Path prefixes (normalized by `parse_prefix`) that may be requested; empty means all.
     allow_paths: Vec<String>,
+    /// Per-client request rate; `None` means no limit.
+    rate: Option<RateSettings>,
+    /// Open connections allowed per client; `None` means no limit.
+    max_connections_per_client: Option<usize>,
+    /// Clients neither limit applies to.
+    rate_limit_exempt: HashSet<EndpointId>,
 }
 
 impl Policy {
@@ -330,19 +357,50 @@ impl Policy {
         let backend = file.get("BACKEND_URL").cloned().or_else(|| args.backend.clone());
         let routes = list("IROH_ROUTES", &args.routes, &[';', '\n']);
         let router = Router::parse(&routes, backend.as_deref(), Duration::from_secs(args.upstream_cooldown_secs))?;
-        let allow_clients = list("IROH_ALLOW_CLIENTS", &args.allow_clients, &[','])
-            .iter()
-            .map(|id| id.trim())
-            .filter(|id| !id.is_empty())
-            .map(|id| id.parse::<EndpointId>().with_context(|| format!("invalid endpoint id in allow list: {id}")))
-            .collect::<Result<HashSet<_>>>()?;
+        let allow_clients = parse_ids(&list("IROH_ALLOW_CLIENTS", &args.allow_clients, &[',']), "allow list")?;
         let allow_paths = list("IROH_ALLOW_PATHS", &args.allow_paths, &[','])
             .iter()
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
             .map(|p| parse_prefix(p))
             .collect::<Result<_>>()?;
-        Ok(Self { router, allow_clients, allow_paths })
+        // A key present in the file with an empty value means "not set", like an unset variable.
+        let number = |key: &str| file.get(key).map(|v| v.trim()).filter(|v| !v.is_empty());
+        let rate_limit = match number("IROH_RATE_LIMIT") {
+            Some(v) => v.parse::<f64>().with_context(|| format!("IROH_RATE_LIMIT: invalid number {v:?}"))?,
+            None if file.contains_key("IROH_RATE_LIMIT") => 0.0,
+            None => args.rate_limit,
+        };
+        let rate_burst = match number("IROH_RATE_BURST") {
+            Some(v) => Some(v.parse::<u32>().with_context(|| format!("IROH_RATE_BURST: invalid number {v:?}"))?),
+            None if file.contains_key("IROH_RATE_BURST") => None,
+            None => args.rate_burst,
+        };
+        let max_connections_per_client = match number("IROH_MAX_CONNECTIONS_PER_CLIENT") {
+            Some(v) => v.parse::<usize>().with_context(|| format!("IROH_MAX_CONNECTIONS_PER_CLIENT: invalid number {v:?}"))?,
+            None if file.contains_key("IROH_MAX_CONNECTIONS_PER_CLIENT") => 0,
+            None => args.max_connections_per_client,
+        };
+        let rate_limit_exempt =
+            parse_ids(&list("IROH_RATE_LIMIT_EXEMPT", &args.rate_limit_exempt, &[',']), "rate limit exempt list")?;
+        Ok(Self {
+            router,
+            allow_clients,
+            allow_paths,
+            rate: RateSettings::new(rate_limit, rate_burst)?,
+            max_connections_per_client: (max_connections_per_client > 0).then_some(max_connections_per_client),
+            rate_limit_exempt,
+        })
+    }
+
+    /// The rate limit that applies to `id`, if any.
+    fn rate_for(&self, id: &EndpointId) -> Option<RateSettings> {
+        self.rate.filter(|_| !self.rate_limit_exempt.contains(id))
+    }
+
+    /// The connection limit that applies to `id`, if any.
+    fn max_connections_for(&self, id: &EndpointId) -> Option<usize> {
+        self.max_connections_per_client.filter(|_| !self.rate_limit_exempt.contains(id))
     }
 
     fn client_allowed(&self, id: &EndpointId) -> bool {
@@ -358,13 +416,35 @@ impl Policy {
         if !self.allow_paths.is_empty() {
             info!("serving only paths under {}", self.allow_paths.iter().map(|p| if p.is_empty() { "/" } else { p.as_str() }).collect::<Vec<_>>().join(", "));
         }
+        if let Some(rate) = self.rate {
+            info!("rate limit: {} requests/s per client, burst {}", rate.rate, rate.burst);
+        }
+        if let Some(max) = self.max_connections_per_client {
+            info!("at most {max} connections per client");
+        }
+        if !self.rate_limit_exempt.is_empty() && (self.rate.is_some() || self.max_connections_per_client.is_some()) {
+            let ids: Vec<_> = self.rate_limit_exempt.iter().map(|id| id.fmt_short().to_string()).collect();
+            info!("exempt from per-client limits: {}", ids.join(", "));
+        }
     }
+}
+
+/// Endpoint ids from a comma-separated list; `what` names the list in errors.
+fn parse_ids(list: &[String], what: &str) -> Result<HashSet<EndpointId>> {
+    list.iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(|id| id.parse::<EndpointId>().with_context(|| format!("invalid endpoint id in {what}: {id}")))
+        .collect()
 }
 
 /// The reloadable keys of a `KEY=value` file; blank lines and `#` comments are skipped, values
 /// may be quoted, and keys this gateway doesn't reload (e.g. IROH_RELAY_TOKEN) are ignored.
 fn read_config_file(path: &Path) -> Result<HashMap<String, String>> {
-    const KEYS: &[&str] = &["BACKEND_URL", "IROH_ROUTES", "IROH_ALLOW_CLIENTS", "IROH_ALLOW_PATHS"];
+    const KEYS: &[&str] = &[
+        "BACKEND_URL", "IROH_ROUTES", "IROH_ALLOW_CLIENTS", "IROH_ALLOW_PATHS",
+        "IROH_RATE_LIMIT", "IROH_RATE_BURST", "IROH_MAX_CONNECTIONS_PER_CLIENT", "IROH_RATE_LIMIT_EXEMPT",
+    ];
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut values = HashMap::new();
     for (n, line) in text.lines().enumerate() {
@@ -389,6 +469,197 @@ fn read_config_file(path: &Path) -> Result<HashMap<String, String>> {
         values.insert(key.to_string(), value.to_string());
     }
     Ok(values)
+}
+
+/// Most clients the rate limiter tracks a bucket for (roughly 100 bytes each). Beyond that,
+/// unknown clients share `RateTable::overflow`.
+const RATE_MAX_CLIENTS: usize = 16_384;
+/// How often buckets that have refilled completely are dropped.
+const RATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// While the table is full, how often an unknown client may trigger a sweep to make room. A
+/// sweep walks the whole table, so a flood of new ids must not run one per request.
+const RATE_FULL_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+/// Longest wait the gateway announces in `retry-after`, for very low rates.
+const RATE_MAX_RETRY_AFTER_SECS: f64 = 86_400.0;
+
+/// `--rate-limit` and `--rate-burst`, validated.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RateSettings {
+    /// Tokens added per second.
+    rate: f64,
+    /// Bucket size: how many requests may come at once.
+    burst: f64,
+}
+
+impl RateSettings {
+    /// `None` when `rate` is 0 (no limit). The burst defaults to twice the rate, at least 1.
+    fn new(rate: f64, burst: Option<u32>) -> Result<Option<Self>> {
+        anyhow::ensure!(rate.is_finite() && rate >= 0.0, "IROH_RATE_LIMIT must be a number of requests per second, 0 for no limit");
+        anyhow::ensure!(burst != Some(0), "IROH_RATE_BURST must be at least 1");
+        if rate == 0.0 {
+            return Ok(None);
+        }
+        let burst = burst.map_or((rate * 2.0).ceil().max(1.0), f64::from);
+        Ok(Some(Self { rate, burst }))
+    }
+}
+
+/// A token bucket: one token per request, refilled at `rate` up to `burst`.
+#[derive(Clone, Copy, Debug)]
+struct Bucket {
+    tokens: f64,
+    /// When `tokens` was last brought up to date.
+    at: Instant,
+}
+
+impl Bucket {
+    fn full(s: RateSettings, now: Instant) -> Self {
+        Self { tokens: s.burst, at: now }
+    }
+
+    /// The tokens there are at `now`. Also clamps to a burst lowered by a reload.
+    fn level(&self, s: RateSettings, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        (self.tokens + elapsed * s.rate).min(s.burst)
+    }
+
+    /// Takes a token, or says how long until there is one.
+    fn take(&mut self, s: RateSettings, now: Instant) -> Result<(), Duration> {
+        self.tokens = self.level(s, now);
+        self.at = self.at.max(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            Ok(())
+        } else {
+            Err(Duration::from_secs_f64(((1.0 - self.tokens) / s.rate).min(RATE_MAX_RETRY_AFTER_SECS)))
+        }
+    }
+
+    /// A full bucket is exactly what a new client gets, so dropping it loses nothing.
+    fn is_full(&self, s: RateSettings, now: Instant) -> bool {
+        self.level(s, now) >= s.burst
+    }
+}
+
+/// Token buckets per client endpoint id, in bounded memory: buckets that have refilled
+/// completely are dropped (they hold no information), and at most `max_clients` are kept.
+///
+/// When the table is full of clients that are all still draining their buckets, unknown
+/// clients share one overflow bucket instead of evicting someone. Endpoint ids cost nothing to
+/// make, so evicting (say, least recently used) would let a flood of fresh ids push out the
+/// clients being limited and hand each new id a full burst. With the overflow bucket a flood
+/// gets one client's allowance in total, clients already tracked keep their own buckets, and
+/// the cost is that genuinely new clients are throttled together until room frees up.
+struct RateLimiter {
+    table: Mutex<RateTable>,
+    max_clients: usize,
+}
+
+struct RateTable {
+    clients: HashMap<EndpointId, Bucket>,
+    overflow: Option<Bucket>,
+    last_sweep: Option<Instant>,
+    last_full_sweep: Option<Instant>,
+}
+
+impl RateLimiter {
+    fn new(max_clients: usize) -> Self {
+        let table = RateTable { clients: HashMap::new(), overflow: None, last_sweep: None, last_full_sweep: None };
+        Self { table: Mutex::new(table), max_clients }
+    }
+
+    /// Counts one request from `id`: `Err` with the time until it may retry when it is over the limit.
+    fn check(&self, id: &EndpointId, s: RateSettings, now: Instant) -> Result<(), Duration> {
+        let mut t = self.table.lock().unwrap();
+        if t.last_sweep.is_none_or(|at| now.saturating_duration_since(at) >= RATE_SWEEP_INTERVAL) {
+            t.sweep(s, now);
+            t.last_sweep = Some(now);
+        }
+        if let Some(bucket) = t.clients.get_mut(id) {
+            return bucket.take(s, now);
+        }
+        if t.clients.len() >= self.max_clients
+            && t.last_full_sweep.is_none_or(|at| now.saturating_duration_since(at) >= RATE_FULL_SWEEP_INTERVAL)
+        {
+            t.sweep(s, now);
+            t.last_full_sweep = Some(now);
+        }
+        if t.clients.len() < self.max_clients {
+            let mut bucket = Bucket::full(s, now);
+            let res = bucket.take(s, now);
+            t.clients.insert(*id, bucket);
+            return res;
+        }
+        t.overflow.get_or_insert_with(|| Bucket::full(s, now)).take(s, now)
+    }
+
+    fn clear(&self) {
+        let mut t = self.table.lock().unwrap();
+        t.clients = HashMap::new();
+        t.overflow = None;
+    }
+
+    /// Clients with a bucket of their own.
+    fn tracked(&self) -> usize {
+        self.table.lock().unwrap().clients.len()
+    }
+}
+
+impl RateTable {
+    fn sweep(&mut self, s: RateSettings, now: Instant) {
+        self.clients.retain(|_, bucket| !bucket.is_full(s, now));
+        if self.overflow.is_some_and(|bucket| bucket.is_full(s, now)) {
+            self.overflow = None;
+        }
+        // Give back the memory of a past flood.
+        if self.clients.capacity() > 1024 && self.clients.capacity() > 4 * self.clients.len() {
+            self.clients.shrink_to_fit();
+        }
+    }
+}
+
+/// Open connections per client. Entries go away with a client's last connection, so the map
+/// never holds more than `--max-connections` entries.
+#[derive(Default)]
+struct ClientConnections(Mutex<HashMap<EndpointId, usize>>);
+
+impl ClientConnections {
+    /// Registers a connection from `id`, unless it already has `max` open. The connection
+    /// counts until the guard is dropped.
+    fn try_add(&self, id: EndpointId, max: Option<usize>) -> Option<ClientConnectionGuard<'_>> {
+        let mut map = self.0.lock().unwrap();
+        let count = map.entry(id).or_insert(0);
+        if max.is_some_and(|max| *count >= max) {
+            if *count == 0 {
+                map.remove(&id);
+            }
+            return None;
+        }
+        *count += 1;
+        Some(ClientConnectionGuard { connections: self, id })
+    }
+
+    #[cfg(test)]
+    fn count(&self, id: &EndpointId) -> usize {
+        self.0.lock().unwrap().get(id).copied().unwrap_or(0)
+    }
+}
+
+struct ClientConnectionGuard<'a> {
+    connections: &'a ClientConnections,
+    id: EndpointId,
+}
+
+impl Drop for ClientConnectionGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = self.connections.0.lock().unwrap();
+        if let Some(count) = map.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.id);
+            }
+        }
+    }
 }
 
 impl Ctx {
@@ -416,6 +687,10 @@ async fn reload_on_sighup(ctx: Arc<Ctx>, args: Args) {
                 info!("configuration reloaded");
                 policy.log_config();
                 ctx.metrics.reloads.fetch_add(1, Ordering::Relaxed);
+                if policy.rate.is_none() {
+                    // Nothing reads the buckets any more; a later re-enable starts everyone full.
+                    ctx.rate_limiter.clear();
+                }
                 *ctx.policy.write().unwrap() = Arc::new(policy);
             }
             Err(err) => {
@@ -444,6 +719,12 @@ struct Ctx {
     upstream_connect_timeout: Duration,
     upstream_timeout: Option<Duration>,
     busy_log: LogThrottle,
+    /// Per-client token buckets for `--rate-limit`.
+    rate_limiter: RateLimiter,
+    /// Open connections per client, for `--max-connections-per-client`.
+    client_connections: ClientConnections,
+    rate_log: LogThrottle,
+    client_connections_log: LogThrottle,
     metrics: Metrics,
 }
 
@@ -768,17 +1049,56 @@ async fn handle_connection(ctx: Arc<Ctx>, conn: Connection) {
         conn.close(VarInt::from_u32(1), b"not allowed");
         return;
     }
+    // Lowering the limit by a reload doesn't close connections that are already open.
+    let max_connections = ctx.policy().max_connections_for(&remote);
+    let Some(_client_connection) = ctx.client_connections.try_add(remote, max_connections) else {
+        if ctx.client_connections_log.allow() {
+            warn!(
+                remote = %remote.fmt_short(),
+                "client already has {} connections open, refusing more (further refusals not logged for 10 s)",
+                max_connections.unwrap_or_default()
+            );
+        }
+        ctx.metrics.reject(Reject::ClientConnectionLimit);
+        conn.close(VarInt::from_u32(2), b"too many connections");
+        return;
+    };
     info!(remote = %remote.fmt_short(), "client connected");
     let _connected = GaugeGuard::new(&ctx.metrics.connections);
     // Each request arrives on its own bidirectional stream, so requests run concurrently.
     while let Ok((mut send, recv)) = conn.accept_bi().await {
+        let policy = ctx.policy();
         // A reload may have removed this client from the allow list since it connected.
-        if !ctx.policy().client_allowed(&remote) {
+        if !policy.client_allowed(&remote) {
             warn!(remote = %remote.fmt_short(), "client no longer in allow list, closing connection");
             ctx.metrics.reject(Reject::ClientNotAllowed);
             conn.close(VarInt::from_u32(1), b"not allowed");
             break;
         }
+        // Checked before anything else: a client over its limit costs no request slot, no head
+        // parsing and no backend work. A WebSocket upgrade counts as one request.
+        if let Some(rate) = policy.rate_for(&remote)
+            && let Err(wait) = ctx.rate_limiter.check(&remote, rate, Instant::now())
+        {
+            let retry_after = secs_ceil(wait).max(1);
+            if ctx.rate_log.allow() {
+                warn!(
+                    remote = %remote.fmt_short(),
+                    "client over the rate limit ({}/s, burst {}), answering 429 (further ones not logged for 10 s)",
+                    rate.rate, rate.burst
+                );
+            }
+            ctx.metrics.reject(Reject::RateLimited);
+            Outcome::new(&ctx.metrics).head(429);
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let extra = [("retry-after", retry_after.to_string())];
+                let _ = respond_text_with(&ctx, &mut send, 429, "too many requests, slow down", &extra).await;
+                drop(recv);
+            });
+            continue;
+        }
+        drop(policy);
         let ctx = ctx.clone();
         let Ok(permit) = ctx.requests.clone().try_acquire_owned() else {
             if ctx.busy_log.allow() {
@@ -1122,10 +1442,14 @@ fn close_message(code: u16, reason: String) -> Message {
 
 /// Answers a request with a short plain-text body, for errors the gateway produces itself.
 async fn respond_text(ctx: &Ctx, send: &mut SendStream, status: u16, body: &str) -> Result<()> {
-    let head = ResponseHead {
-        status,
-        headers: vec![("content-type".into(), "text/plain".into()), ("x-iroh-gateway-id".into(), ctx.gateway_id.clone())],
-    };
+    respond_text_with(ctx, send, status, body, &[]).await
+}
+
+/// `respond_text` with extra response headers.
+async fn respond_text_with(ctx: &Ctx, send: &mut SendStream, status: u16, body: &str, extra: &[(&str, String)]) -> Result<()> {
+    let mut headers = vec![("content-type".into(), "text/plain".into()), ("x-iroh-gateway-id".into(), ctx.gateway_id.clone())];
+    headers.extend(extra.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    let head = ResponseHead { status, headers };
     proto::write_head(send, &head).await?;
     send.write_all(body.as_bytes()).await?;
     send.finish()?;
@@ -1305,13 +1629,16 @@ enum Reject {
     BodyTooLarge,
     BodyTimeout,
     UpstreamTimeout,
+    RateLimited,
+    ClientConnectionLimit,
 }
 
 impl Reject {
-    const ALL: [Reject; 11] = [
+    const ALL: [Reject; 13] = [
         Reject::ClientNotAllowed, Reject::ConnectionLimit, Reject::TooManyRequests, Reject::BadRequest,
         Reject::HeadTooLarge, Reject::HeadTimeout, Reject::PathNotAllowed, Reject::NoRoute,
-        Reject::BodyTooLarge, Reject::BodyTimeout, Reject::UpstreamTimeout,
+        Reject::BodyTooLarge, Reject::BodyTimeout, Reject::UpstreamTimeout, Reject::RateLimited,
+        Reject::ClientConnectionLimit,
     ];
 
     fn label(self) -> &'static str {
@@ -1327,6 +1654,8 @@ impl Reject {
             Reject::BodyTooLarge => "body_too_large",
             Reject::BodyTimeout => "body_timeout",
             Reject::UpstreamTimeout => "upstream_timeout",
+            Reject::RateLimited => "rate_limited",
+            Reject::ClientConnectionLimit => "client_connection_limit",
         }
     }
 }
@@ -1452,7 +1781,7 @@ fn prom_label(value: &str) -> String {
 }
 
 /// The `/metrics` page. Writing to a `String` can't fail, hence the ignored results.
-fn render_metrics(router: &Router, metrics: &Metrics, inflight: usize) -> String {
+fn render_metrics(router: &Router, metrics: &Metrics, inflight: usize, rate_limited_clients: usize) -> String {
     let mut out = String::new();
     let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
     let routes: Vec<(&str, &Upstreams)> = router.all().collect();
@@ -1507,6 +1836,9 @@ fn render_metrics(router: &Router, metrics: &Metrics, inflight: usize) -> String
     let _ = writeln!(out, "# HELP iroh_gateway_inflight_requests Requests and WebSockets in progress.");
     let _ = writeln!(out, "# TYPE iroh_gateway_inflight_requests gauge");
     let _ = writeln!(out, "iroh_gateway_inflight_requests {inflight}");
+    let _ = writeln!(out, "# HELP iroh_gateway_rate_limit_tracked_clients Clients with a rate limit bucket of their own (the rest share one).");
+    let _ = writeln!(out, "# TYPE iroh_gateway_rate_limit_tracked_clients gauge");
+    let _ = writeln!(out, "iroh_gateway_rate_limit_tracked_clients {rate_limited_clients}");
 
     let _ = writeln!(out, "# HELP iroh_gateway_request_duration_seconds Time from a request's start to its response head.");
     let _ = writeln!(out, "# TYPE iroh_gateway_request_duration_seconds histogram");
@@ -1633,7 +1965,7 @@ fn admin_response(admin: &Admin, method: &str, path: &str) -> (u16, &'static str
             (status, ADMIN_TEXT, body)
         }
         "/status" => (200, "application/json", admin.status().to_string()),
-        _ => (200, "text/plain; version=0.0.4; charset=utf-8", render_metrics(&admin.ctx.policy().router, &admin.ctx.metrics, admin.inflight())),
+        _ => (200, "text/plain; version=0.0.4; charset=utf-8", render_metrics(&admin.ctx.policy().router, &admin.ctx.metrics, admin.inflight(), admin.ctx.rate_limiter.tracked())),
     }
 }
 
@@ -1713,6 +2045,13 @@ impl Admin {
             "connections": self.ctx.metrics.connections.load(Ordering::Relaxed),
             "inflight_requests": self.inflight(),
             "max_requests": self.ctx.max_requests,
+            "rate_limit": {
+                "requests_per_sec": policy.rate.map(|r| r.rate),
+                "burst": policy.rate.map(|r| r.burst),
+                "max_connections_per_client": policy.max_connections_per_client,
+                "exempt_clients": policy.rate_limit_exempt.len(),
+                "tracked_clients": self.ctx.rate_limiter.tracked(),
+            },
             "routes": routes,
         })
     }
@@ -1968,7 +2307,8 @@ mod tests {
         metrics.observe(Duration::from_millis(30));
         metrics.observe(Duration::from_secs(60));
 
-        let text = render_metrics(&router, &metrics, 3);
+        metrics.reject(Reject::RateLimited);
+        let text = render_metrics(&router, &metrics, 3, 5);
         for line in [
             r#"iroh_gateway_requests_total{route="default",status_class="2xx"} 1"#,
             r#"iroh_gateway_requests_total{route="default",status_class="5xx"} 0"#,
@@ -1979,6 +2319,9 @@ mod tests {
             r#"iroh_gateway_upstream_healthy{route="default",upstream="http://127.0.0.1:1"} 0"#,
             r#"iroh_gateway_upstream_healthy{route="default",upstream="http://127.0.0.1:2"} 1"#,
             r#"iroh_gateway_rejected_total{reason="path_not_allowed"} 1"#,
+            r#"iroh_gateway_rejected_total{reason="rate_limited"} 1"#,
+            r#"iroh_gateway_rejected_total{reason="client_connection_limit"} 0"#,
+            "iroh_gateway_rate_limit_tracked_clients 5",
             "iroh_gateway_connections 0",
             "iroh_gateway_inflight_requests 3",
             // The two recorded heads took next to no time.
@@ -2038,6 +2381,186 @@ mod tests {
         assert!(Policy::load(&args).is_err());
         std::fs::remove_file(&path).unwrap();
         assert!(Policy::load(&args).is_err(), "a missing file is an error, not an empty config");
+    }
+
+    fn rate(rate: f64, burst: u32) -> RateSettings {
+        RateSettings::new(rate, Some(burst)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn rate_settings_default_and_validate() {
+        assert_eq!(RateSettings::new(0.0, Some(5)).unwrap(), None, "0 turns the limit off");
+        assert_eq!(RateSettings::new(10.0, None).unwrap(), Some(RateSettings { rate: 10.0, burst: 20.0 }));
+        assert_eq!(RateSettings::new(0.2, None).unwrap(), Some(RateSettings { rate: 0.2, burst: 1.0 }), "burst at least 1");
+        assert_eq!(RateSettings::new(1.5, None).unwrap().unwrap().burst, 3.0);
+        assert_eq!(RateSettings::new(5.0, Some(1)).unwrap().unwrap().burst, 1.0);
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(RateSettings::new(bad, None).is_err(), "{bad}");
+        }
+        assert!(RateSettings::new(5.0, Some(0)).is_err());
+    }
+
+    #[test]
+    fn bucket_allows_a_burst_then_the_rate() {
+        let s = rate(2.0, 3);
+        let t0 = Instant::now();
+        let mut b = Bucket::full(s, t0);
+        for _ in 0..3 {
+            assert_eq!(b.take(s, t0), Ok(()));
+        }
+        // Empty: the next token comes in 1/rate seconds.
+        assert_eq!(b.take(s, t0), Err(Duration::from_millis(500)));
+        assert_eq!(b.take(s, t0 + Duration::from_millis(250)), Err(Duration::from_millis(250)));
+        assert_eq!(b.take(s, t0 + Duration::from_millis(500)), Ok(()));
+        assert!(b.take(s, t0 + Duration::from_millis(600)).is_err());
+        // Refills up to the burst, never beyond.
+        let later = t0 + Duration::from_secs(60);
+        assert!(b.is_full(s, later));
+        for _ in 0..3 {
+            assert_eq!(b.take(s, later), Ok(()));
+        }
+        assert!(b.take(s, later).is_err());
+        // A burst lowered by a reload applies at once.
+        let mut b = Bucket::full(s, t0);
+        let lower = rate(2.0, 1);
+        assert_eq!(b.take(lower, t0), Ok(()));
+        assert!(b.take(lower, t0).is_err());
+        // A tiny rate announces a bounded wait.
+        let slow = rate(1e-9, 1);
+        let mut b = Bucket::full(slow, t0);
+        assert_eq!(b.take(slow, t0), Ok(()));
+        assert_eq!(b.take(slow, t0), Err(Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn rate_limiter_is_per_client() {
+        let s = rate(1.0, 2);
+        let limiter = RateLimiter::new(100);
+        let (a, b) = (SecretKey::generate().public(), SecretKey::generate().public());
+        let t0 = Instant::now();
+        assert!(limiter.check(&a, s, t0).is_ok());
+        assert!(limiter.check(&a, s, t0).is_ok());
+        assert!(limiter.check(&a, s, t0).is_err());
+        // Another client has its own bucket.
+        assert!(limiter.check(&b, s, t0).is_ok());
+        assert!(limiter.check(&a, s, t0 + Duration::from_secs(1)).is_ok());
+        assert_eq!(limiter.tracked(), 2);
+        limiter.clear();
+        assert_eq!(limiter.tracked(), 0);
+        assert!(limiter.check(&a, s, t0).is_ok(), "cleared buckets start full");
+    }
+
+    #[test]
+    fn rate_limiter_evicts_full_buckets() {
+        let s = rate(0.1, 2);
+        let limiter = RateLimiter::new(100);
+        let t0 = Instant::now();
+        let (idle, busy) = (SecretKey::generate().public(), SecretKey::generate().public());
+        limiter.check(&idle, s, t0).unwrap(); // first check also sweeps (nothing there yet)
+        let t1 = t0 + RATE_SWEEP_INTERVAL - Duration::from_secs(1);
+        // `busy` empties its bucket right before the next sweep, `idle` has long refilled.
+        limiter.check(&busy, s, t1).unwrap();
+        limiter.check(&busy, s, t1).unwrap();
+        assert_eq!(limiter.tracked(), 2);
+        let t2 = t0 + RATE_SWEEP_INTERVAL;
+        assert!(limiter.check(&busy, s, t2).is_err(), "still draining, so kept and limited");
+        assert_eq!(limiter.tracked(), 1, "the full bucket was dropped");
+        // Dropping it lost nothing: it comes back full.
+        assert!(limiter.check(&idle, s, t2).is_ok());
+        assert!(limiter.check(&idle, s, t2).is_ok());
+        assert!(limiter.check(&idle, s, t2).is_err());
+    }
+
+    #[test]
+    fn rate_limiter_caps_tracked_clients() {
+        let s = rate(1.0, 1);
+        let limiter = RateLimiter::new(2);
+        let t0 = Instant::now();
+        let ids: Vec<_> = (0..5).map(|_| SecretKey::generate().public()).collect();
+        assert!(limiter.check(&ids[0], s, t0).is_ok());
+        assert!(limiter.check(&ids[1], s, t0).is_ok());
+        assert_eq!(limiter.tracked(), 2);
+        // The table is full of draining buckets: new ids share one overflow bucket.
+        assert!(limiter.check(&ids[2], s, t0).is_ok());
+        assert!(limiter.check(&ids[3], s, t0).is_err(), "shares the overflow bucket ids[2] emptied");
+        assert!(limiter.check(&ids[4], s, t0).is_err());
+        assert_eq!(limiter.tracked(), 2, "the table did not grow");
+        // Tracked clients keep their own buckets meanwhile.
+        assert!(limiter.check(&ids[0], s, t0 + Duration::from_millis(1100)).is_ok());
+        // Once buckets have refilled, a full table makes room for new clients (at most once
+        // per RATE_FULL_SWEEP_INTERVAL).
+        let later = t0 + Duration::from_secs(5);
+        assert!(limiter.check(&ids[3], s, later).is_ok());
+        assert!(limiter.check(&ids[3], s, later).is_err(), "now with a bucket of its own");
+        assert!(limiter.check(&ids[4], s, later).is_ok());
+        assert_eq!(limiter.tracked(), 2);
+
+        // Many fresh ids never grow the table past its cap.
+        let limiter = RateLimiter::new(50);
+        for _ in 0..1000 {
+            let _ = limiter.check(&SecretKey::generate().public(), s, t0);
+        }
+        assert_eq!(limiter.tracked(), 50);
+    }
+
+    #[test]
+    fn client_connections_are_capped_and_released() {
+        let conns = ClientConnections::default();
+        let (a, b) = (SecretKey::generate().public(), SecretKey::generate().public());
+        let first = conns.try_add(a, Some(2)).unwrap();
+        let second = conns.try_add(a, Some(2)).unwrap();
+        assert!(conns.try_add(a, Some(2)).is_none());
+        assert!(conns.try_add(a, None).is_some(), "no limit (or exempt)");
+        assert!(conns.try_add(b, Some(2)).is_some(), "per client");
+        assert_eq!(conns.count(&a), 2);
+        drop(first);
+        let third = conns.try_add(a, Some(2)).unwrap();
+        drop((second, third));
+        assert_eq!(conns.count(&a), 0);
+        assert!(conns.0.lock().unwrap().is_empty(), "no entries left behind");
+        assert!(conns.try_add(b, Some(0)).is_none());
+        assert!(conns.0.lock().unwrap().is_empty(), "a refusal leaves no entry either");
+    }
+
+    #[test]
+    fn rate_limit_settings_reload_from_the_config_file() {
+        let dir = std::env::temp_dir().join(format!("iroh-gateway-rate-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gateway.env");
+        let exempt = SecretKey::generate().public();
+        let other = SecretKey::generate().public();
+        std::fs::write(&path, "").unwrap();
+        let args = Args::parse_from([
+            "iroh-gateway", "--rate-limit", "5", "--max-connections-per-client", "3",
+            "--rate-limit-exempt", &exempt.to_string(), "--config-file", path.to_str().unwrap(),
+        ]);
+        let policy = Policy::load(&args).unwrap();
+        assert_eq!(policy.rate_for(&other), Some(RateSettings { rate: 5.0, burst: 10.0 }));
+        assert_eq!(policy.rate_for(&exempt), None);
+        assert_eq!(policy.max_connections_for(&other), Some(3));
+        assert_eq!(policy.max_connections_for(&exempt), None);
+
+        std::fs::write(
+            &path,
+            format!("IROH_RATE_LIMIT=0.5\nIROH_RATE_BURST=4\nIROH_MAX_CONNECTIONS_PER_CLIENT=0\nIROH_RATE_LIMIT_EXEMPT={other}\n"),
+        )
+        .unwrap();
+        let policy = Policy::load(&args).unwrap();
+        assert_eq!(policy.rate_for(&exempt), Some(RateSettings { rate: 0.5, burst: 4.0 }));
+        assert_eq!(policy.rate_for(&other), None);
+        assert_eq!(policy.max_connections_for(&exempt), None);
+
+        // An empty value means unset: no limit, default burst.
+        std::fs::write(&path, "IROH_RATE_LIMIT=\nIROH_RATE_BURST=\n").unwrap();
+        let policy = Policy::load(&args).unwrap();
+        assert_eq!(policy.rate, None);
+        assert_eq!(policy.max_connections_per_client, Some(3), "not in the file, so the flag applies");
+
+        for bad in ["IROH_RATE_LIMIT=fast", "IROH_RATE_LIMIT=-1", "IROH_RATE_BURST=0", "IROH_MAX_CONNECTIONS_PER_CLIENT=x", "IROH_RATE_LIMIT_EXEMPT=nope"] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(Policy::load(&args).is_err(), "{bad}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

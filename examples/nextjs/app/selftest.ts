@@ -113,16 +113,19 @@ export const checks: Check[] = [
     },
   },
   {
-    name: "HA: requests spread over both gateways of A",
-    run: async () => {
-      const seen = new Set<string>();
-      for (let i = 0; i < 6; i++) {
-        const res = await fetch(`${API}/hello`);
-        await res.text();
-        seen.add(res.headers.get("x-iroh-gateway-id") ?? "?");
-      }
-      assert(seen.size >= 2, `only ${[...seen].join(", ")}`);
-      return `${seen.size} gateways`;
+    name: "HA: a standby gateway is connected for every backend",
+    run: async ({ client }) => {
+      // Each backend has a primary (own relay) and a standby (public relays) for failover.
+      const summary = client.backends.map((b) => {
+        const up = b.replicas.filter((r) => r.connected).length;
+        assert(up === b.replicas.length, `${b.origin}: ${up}/${b.replicas.length} replicas connected`);
+        return `${new URL(b.origin!).hostname} ${up}/${b.replicas.length}`;
+      });
+      const res = await fetch(`${API}/hello`);
+      await res.text();
+      const primary = client.backends[0].replicas[0].endpointId;
+      assert(res.headers.get("x-iroh-gateway-id") === primary, "requests should use the primary while it's up");
+      return summary.join(", ");
     },
   },
   {

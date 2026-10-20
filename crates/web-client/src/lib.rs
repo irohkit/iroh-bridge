@@ -1,7 +1,7 @@
 //! iroh HTTP client compiled to WebAssembly. Runs in browsers and in Node.js >= 22.
 //! Browsers can't send raw UDP, so connections always go through an iroh relay.
 
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
 use anyhow::{Context, Result};
 use iroh::{
@@ -64,7 +64,17 @@ impl IrohClient {
         // publishing its address would just cost every page load a DNS round trip.
         let mut builder = Endpoint::builder(presets::Minimal)
             .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns())
-            .relay_mode(RelayMode::Default);
+            .relay_mode(RelayMode::Default)
+            // Notice a dead relay or gateway within seconds instead of the ~30 s defaults, so
+            // requests fail over to another replica quickly. Keep-alives over a relay are cheap.
+            .transport_config(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .keep_alive_interval(Duration::from_secs(1))
+                    .default_path_keep_alive_interval(Duration::from_secs(1))
+                    .default_path_max_idle_timeout(Duration::from_secs(4))
+                    .max_idle_timeout(Some(Duration::from_secs(5).try_into().expect("valid idle timeout")))
+                    .build(),
+            );
         let mut relay_hints = Vec::new();
         if let Some(hex) = secret_key.filter(|k| !k.is_empty()) {
             builder = builder.secret_key(parse_secret_key(&hex).map_err(js)?);

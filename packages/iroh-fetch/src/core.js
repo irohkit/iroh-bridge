@@ -232,6 +232,9 @@ function replicaOrder(b) {
     healthy = [...healthy.slice(k), ...healthy.slice(0, k)];
   }
   const down = b.replicas.filter((r) => r.downUntil > now).sort((x, y) => x.downUntil - y.downUntil);
+  // Reconnect replicas that came out of cooldown in the background, off the request path, so a
+  // recovered primary is preferred again as soon as it's back.
+  for (const r of healthy) if (!r.connected) r.ensureConnected().catch(() => {});
   return [...healthy, ...down];
 }
 

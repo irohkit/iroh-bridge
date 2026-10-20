@@ -135,6 +135,13 @@ export interface IrohFetch {
    * opens itself (downloads, "open in new tab"), which a service worker can't catch cross-origin.
    */
   proxyUrl(url: string | URL): string;
+  /**
+   * Fetch `url` over iroh and return a `blob:` URL of the body, for `<img>` / `<video>` where no
+   * service worker is available (iOS in-app browsers such as LINE, some private modes). Rejects on
+   * non-2xx responses. Call `URL.revokeObjectURL()` when done; in React use `useIrohObjectUrl` or
+   * `<IrohImage>`, which do that for you.
+   */
+  objectUrl(url: string | URL, init?: RequestInit): Promise<string>;
   /** This client's secret key (hex): pass it as `secretKey` later to keep the same endpoint id. */
   exportSecretKey(): string;
   /**

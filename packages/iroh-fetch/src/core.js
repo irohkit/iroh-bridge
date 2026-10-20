@@ -171,6 +171,8 @@ export function makeCreate(init) {
       ...root,
       serviceWorker: (opts) => registerServiceWorker(root.fetch, opts?.hosts ?? hosts, opts),
       proxyUrl: (url) => proxyUrl(url, hosts),
+      /** Fetches `url` over iroh and returns a blob: URL for <img>/<video> without a service worker. */
+      objectUrl: (url, init) => objectUrl(root.fetch, url, init),
       /** Scope everything to one backend, so path-only URLs go there: `iroh.backend("https://files.example.com")`. */
       backend(origin) {
         const host = new URL(origin).host;
@@ -574,6 +576,19 @@ async function serveForWorker(irohFetch, req, port) {
   } catch (err) {
     port.postMessage({ type: "error", message: String(err?.message ?? err) });
   }
+}
+
+/**
+ * Loads a backend URL with iroh-fetch and returns a `blob:` URL for it, for places the browser would
+ * load it by itself (<img>, <video>) where no service worker is available. Revoke it when done.
+ */
+async function objectUrl(irohFetch, url, init) {
+  const res = await irohFetch(url, init);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`iroh-fetch: ${String(url)} -> ${res.status}`);
+  }
+  return URL.createObjectURL(await res.blob());
 }
 
 /** A same-origin URL for a backend URL, for links the browser opens itself (downloads, new tabs). */

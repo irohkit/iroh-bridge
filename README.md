@@ -70,7 +70,7 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
 | **Trustworthy caller identity** | the backend gets `X-Iroh-Remote-Id`, the caller's cryptographically verified endpoint id |
 | **Stable client identity** | optional fixed endpoint id per device or server (`persistIdentity`, `secretKey`) for allow-lists and rate limits |
 | **Monitoring** | gateway `/healthz`, `/readyz`, `/status` and Prometheus `/metrics` on a local admin port |
-| **React bindings** | `iroh-fetch/react`: `<IrohProvider>`, `useIroh()`, `useIrohFetch()` |
+| **React bindings** | `iroh-fetch/react`: `<IrohProvider>`, `useIroh()`, `useIrohFetch()`, `<IrohImage>`, `useIrohObjectUrl()` |
 | **Runs anywhere** | browsers and Node.js ≥ 22; gateway binaries for Linux x86_64/arm64 and macOS, a Docker image, and a systemd unit |
 | **Local port** | `iroh-proxy` exposes a gateway as `http://127.0.0.1:PORT` for curl, Postman or any HTTP client |
 
@@ -194,8 +194,36 @@ need HTTPS (or localhost).
 Some browsers have no usable service worker: in-app browsers on iOS (LINE, Facebook, Instagram) and some private
 modes. There `serviceWorker()` stops waiting for control after 5 s and returns `controlled: false`, and
 `<IrohProvider serviceWorker>` logs a warning and carries on. `fetch`, XHR, `WebSocket` and `EventSource` keep
-working; only browser-initiated loads (`<img>`, `<video>`, CSS, downloads) of backend URLs don't. Where that matters,
-load the bytes with `fetch` and show them through `URL.createObjectURL(await res.blob())`.
+working; only browser-initiated loads (`<img>`, `<video>`, CSS, downloads) of backend URLs don't by themselves. For
+images and media, use the fallbacks below, which load the bytes over iroh into a `blob:` URL.
+
+In React, `<IrohImage>` takes the same props as `<img>`. It lets the service worker load the image when one controls
+the page, and otherwise fetches it over iroh into a `blob:` URL, which it revokes on unmount or when `src` changes.
+`useIrohObjectUrl(url)` does the fetching part for anything else, such as `<video>` or a background image:
+
+```tsx
+import { IrohImage, useIrohObjectUrl } from "iroh-fetch/react";
+
+<IrohImage src="https://api.example.com/avatars/42.png" alt="" />  {/* worker or blob: URL, whichever works */}
+
+function Clip({ src }: { src: string }) {
+  const { url, loading, error } = useIrohObjectUrl(src); // revoked on unmount or src change
+  if (error) return <p>Couldn't load the video: {error.message}</p>;
+  return loading ? <p>Loading…</p> : <video src={url} controls />;
+}
+```
+
+Without React, `iroh.objectUrl(url)` returns a `blob:` URL (and rejects on a non-2xx response); revoke it when done:
+
+```ts
+const url = await iroh.objectUrl("https://api.example.com/avatars/42.png");
+img.src = url;
+img.onload = () => URL.revokeObjectURL(url);
+```
+
+The fallback downloads the whole file before showing it, so `<video>` can't seek before it has loaded and large files
+sit in memory; with a service worker, Range requests stream instead. Relative, `data:` and `blob:` sources, and URLs
+of origins that aren't backends, pass through `<IrohImage>` unchanged.
 
 ### Stable client identity
 
@@ -355,7 +383,7 @@ connects in about a second).
 | `logLevel` | off | `"info"`, `"debug"`, ... iroh logs in the console |
 
 The client object: `fetch`, `XMLHttpRequest`, `EventSource`, `WebSocket`, `websocket(url, { protocols, headers })`,
-`install(opts)`, `serviceWorker(opts)`, `proxyUrl(url)`, `backend(origin)`, `backends`, `cookies`, `endpointId` (this
+`install(opts)`, `serviceWorker(opts)`, `proxyUrl(url)`, `objectUrl(url, init)`, `backend(origin)`, `backends`, `cookies`, `endpointId` (this
 client's id, which the backend sees as `X-Iroh-Remote-Id`), `exportSecretKey()`, `close()`.
 
 ## Backend: `iroh-gateway`

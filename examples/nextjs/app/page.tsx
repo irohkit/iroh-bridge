@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useIroh } from "iroh-fetch/react";
+import { IrohImage, useIroh } from "iroh-fetch/react";
 import { API, FILES } from "../iroh.config";
 import { checks } from "./selftest";
 
@@ -24,6 +24,7 @@ export default function Home() {
       <EventSourceDemo />
       <WebSocketDemo />
       <UploadDemo />
+      <ImageDemo />
     </main>
   );
 }
@@ -226,6 +227,27 @@ function WebSocketDemo() {
         </button>
       </div>
       <pre data-testid="ws" style={pre}>{log.join("\n")}</pre>
+    </section>
+  );
+}
+
+function ImageDemo() {
+  const [sw, setSw] = useState<boolean | null>(null);
+  useEffect(() => {
+    const update = () => setSw(Boolean(navigator.serviceWorker?.controller));
+    update();
+    navigator.serviceWorker?.addEventListener("controllerchange", update);
+    return () => navigator.serviceWorker?.removeEventListener("controllerchange", update);
+  }, []);
+  return (
+    <section>
+      <h2>Images</h2>
+      <p>
+        <code>&lt;IrohImage src=&quot;{FILES}/image.svg&quot; /&gt;</code> loads through the service worker where there is
+        one, and otherwise (LINE, Facebook and Instagram on iOS, some private modes) over iroh into a <code>blob:</code> URL.
+        {sw !== null && <> Here: {sw ? "service worker" : "blob: URL"}.</>}
+      </p>
+      <IrohImage src={`${FILES}/image.svg`} alt="Image served by backend B" width={96} height={96} data-testid="iroh-image" />
     </section>
   );
 }

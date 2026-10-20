@@ -8,3 +8,4 @@ node_modules
 
 # local native addon builds (scripts/build-native.sh)
 packages/iroh-fetch/native/
+.claude/

@@ -41,6 +41,7 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
   - [Configuration](#configuration)
   - [Several upstreams, routing by host and path](#several-upstreams-routing-by-host-and-path)
   - [Access control](#access-control)
+  - [Changing routes and allow lists without a restart](#changing-routes-and-allow-lists-without-a-restart)
   - [What your backend sees](#what-your-backend-sees)
   - [Monitoring](#monitoring)
 - [Local port: `iroh-proxy`](#local-port-iroh-proxy)
@@ -388,6 +389,7 @@ needs outbound UDP/HTTPS, and no inbound port.
 | `UPSTREAM_COOLDOWN_SECS` | `10` | how long an unreachable upstream is skipped |
 | `RUST_LOG` | `iroh_gateway=info` | log level. Logs go to stdout through a buffer: if the log reader stalls, lines are dropped instead of blocking requests |
 | `IROH_ADMIN_ADDR` / `--admin-addr` | off | local admin port for health and metrics ([Monitoring](#monitoring)) |
+| `IROH_CONFIG_FILE` / `--config-file` | | file with settings that reload without a restart ([below](#changing-routes-and-allow-lists-without-a-restart)) |
 
 Limits and timeouts, all with flags of the same name (`--max-head`, `--head-timeout-secs`, ...). The defaults are generous
 for normal use and stop a single client from tying the gateway up:
@@ -427,6 +429,26 @@ IROH_ALLOW_PATHS=/api,/ws                        # everything else gets 403
 Client endpoint ids are random per browser session unless you give the client a fixed key, so the client allow-list is
 mostly useful for server-to-server use (Node, `iroh-proxy`). For browser users, authenticate in your backend as you would
 on a public URL (sessions, tokens). `X-Iroh-Remote-Id` gives you a verified id to rate-limit or audit by.
+
+### Changing routes and allow lists without a restart
+
+Put the settings you want to change at runtime in a file and point `IROH_CONFIG_FILE` at it. It uses the systemd
+`EnvironmentFile` format, so the same file can hold the gateway's other variables too (only these four are reloaded):
+
+```bash
+# /etc/iroh-gateway.env
+BACKEND_URL=http://127.0.0.1:8080
+IROH_ROUTES="api.example.com=http://127.0.0.1:8080;/admin=http://127.0.0.1:9100"
+IROH_ALLOW_CLIENTS=
+IROH_ALLOW_PATHS=
+```
+
+Edit it, then send `SIGHUP`: `systemctl reload iroh-gateway` (the shipped unit has `ExecReload`), or
+`docker kill -s HUP <container>`. Open connections stay up, requests in flight finish on the config they started
+with, and new requests use the new one. A client removed from `IROH_ALLOW_CLIENTS` is disconnected on its next request.
+A file with an error is rejected as a whole; the gateway logs why and keeps running the previous config. Values in the
+file override flags and environment; a key left out of the file falls back to them. Upstream health and per-route
+counters start fresh for the reloaded routes; `iroh_gateway_config_reloads_total{result="ok"|"error"}` counts reloads.
 
 ### Monitoring
 

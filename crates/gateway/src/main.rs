@@ -1,14 +1,14 @@
 //! Runs next to an existing HTTP backend (behind any NAT) and exposes it over iroh.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::Write as _,
     future::Future,
     io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -51,7 +51,7 @@ const WS_HANDSHAKE_HEADERS: &[&str] = &[
     "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "sec-websocket-accept",
 ];
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(about = "Expose a local HTTP backend over iroh")]
 struct Args {
     /// Base URL of the HTTP backend to forward requests to. Several comma-separated URLs are
@@ -119,6 +119,12 @@ struct Args {
     /// Streaming responses such as SSE are not limited once they started.
     #[arg(long, env = "UPSTREAM_TIMEOUT_SECS", default_value_t = 300)]
     upstream_timeout_secs: u64,
+    /// File with settings that can be changed without a restart: BACKEND_URL, IROH_ROUTES,
+    /// IROH_ALLOW_CLIENTS and IROH_ALLOW_PATHS as `KEY=value` lines (systemd EnvironmentFile
+    /// format; other keys are ignored). Its values override the flags and environment. Re-read on
+    /// SIGHUP (`systemctl reload`); a file with errors is rejected and the running config kept.
+    #[arg(long, env = "IROH_CONFIG_FILE", value_name = "PATH")]
+    config_file: Option<PathBuf>,
     /// Serve /healthz, /readyz, /status and /metrics over plain HTTP on this address, e.g.
     /// 127.0.0.1:9180. Off by default. It has no authentication, so only loopback addresses are
     /// accepted unless --admin-allow-public is given.
@@ -152,21 +158,7 @@ async fn main() -> Result<()> {
         .init();
     let started = Instant::now();
     let args = Args::parse();
-    let router = Router::parse(&args.routes, args.backend.as_deref(), Duration::from_secs(args.upstream_cooldown_secs))?;
-    let allow_clients = args
-        .allow_clients
-        .iter()
-        .map(|id| id.trim())
-        .filter(|id| !id.is_empty())
-        .map(|id| id.parse::<EndpointId>().with_context(|| format!("invalid endpoint id in allow list: {id}")))
-        .collect::<Result<HashSet<_>>>()?;
-    let allow_paths: Vec<String> = args
-        .allow_paths
-        .iter()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .map(parse_prefix)
-        .collect::<Result<_>>()?;
+    let policy = Policy::load(&args).context("invalid configuration")?;
     anyhow::ensure!(args.max_connections > 0 && args.max_requests > 0, "connection and request limits must be at least 1");
     anyhow::ensure!(args.max_streams_per_connection > 0, "--max-streams-per-connection must be at least 1");
     // Bound before anything else so a typo or a taken port fails the start, not just the listener.
@@ -205,9 +197,7 @@ async fn main() -> Result<()> {
     let ctx = Arc::new(Ctx {
         gateway_id: endpoint.id().to_string(),
         http,
-        router,
-        allow_clients,
-        allow_paths,
+        policy: RwLock::new(Arc::new(policy)),
         max_body: args.max_body,
         max_head: args.max_head,
         max_ws_message: args.max_ws_message,
@@ -235,14 +225,9 @@ async fn main() -> Result<()> {
     }
     endpoint.online().await;
 
-    ctx.router.log_config();
-    if !ctx.allow_clients.is_empty() {
-        let ids: Vec<_> = ctx.allow_clients.iter().map(|id| id.fmt_short().to_string()).collect();
-        info!("accepting only clients {}", ids.join(", "));
-    }
-    if !ctx.allow_paths.is_empty() {
-        info!("serving only paths under {}", ctx.allow_paths.iter().map(|p| if p.is_empty() { "/" } else { p.as_str() }).collect::<Vec<_>>().join(", "));
-    }
+    ctx.policy().log_config();
+    #[cfg(unix)]
+    tokio::spawn(reload_on_sighup(ctx.clone(), args.clone()));
     println!("\nIROH_ENDPOINT_ID={}\n", endpoint.id());
 
     let connections = Arc::new(Semaphore::new(args.max_connections));
@@ -320,16 +305,134 @@ impl LogThrottle {
     }
 }
 
-struct Ctx {
-    /// This gateway's endpoint id, returned as `X-Iroh-Gateway-Id` so clients with several
-    /// replicas can tell which one answered.
-    gateway_id: String,
-    http: reqwest::Client,
+/// The settings a reload can change.
+struct Policy {
     router: Router,
     /// Endpoint ids allowed to connect; empty means anyone.
     allow_clients: HashSet<EndpointId>,
     /// Path prefixes (normalized by `parse_prefix`) that may be requested; empty means all.
     allow_paths: Vec<String>,
+}
+
+impl Policy {
+    /// Builds the policy from the flags and environment, overridden by `--config-file` if given.
+    fn load(args: &Args) -> Result<Self> {
+        let file = match &args.config_file {
+            Some(path) => read_config_file(path)?,
+            None => HashMap::new(),
+        };
+        let list = |key: &str, from_args: &[String], separators: &[char]| -> Vec<String> {
+            match file.get(key) {
+                Some(value) => value.split(separators).map(str::to_string).collect(),
+                None => from_args.to_vec(),
+            }
+        };
+        let backend = file.get("BACKEND_URL").cloned().or_else(|| args.backend.clone());
+        let routes = list("IROH_ROUTES", &args.routes, &[';', '\n']);
+        let router = Router::parse(&routes, backend.as_deref(), Duration::from_secs(args.upstream_cooldown_secs))?;
+        let allow_clients = list("IROH_ALLOW_CLIENTS", &args.allow_clients, &[','])
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .map(|id| id.parse::<EndpointId>().with_context(|| format!("invalid endpoint id in allow list: {id}")))
+            .collect::<Result<HashSet<_>>>()?;
+        let allow_paths = list("IROH_ALLOW_PATHS", &args.allow_paths, &[','])
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(|p| parse_prefix(p))
+            .collect::<Result<_>>()?;
+        Ok(Self { router, allow_clients, allow_paths })
+    }
+
+    fn client_allowed(&self, id: &EndpointId) -> bool {
+        self.allow_clients.is_empty() || self.allow_clients.contains(id)
+    }
+
+    fn log_config(&self) {
+        self.router.log_config();
+        if !self.allow_clients.is_empty() {
+            let ids: Vec<_> = self.allow_clients.iter().map(|id| id.fmt_short().to_string()).collect();
+            info!("accepting only clients {}", ids.join(", "));
+        }
+        if !self.allow_paths.is_empty() {
+            info!("serving only paths under {}", self.allow_paths.iter().map(|p| if p.is_empty() { "/" } else { p.as_str() }).collect::<Vec<_>>().join(", "));
+        }
+    }
+}
+
+/// The reloadable keys of a `KEY=value` file; blank lines and `#` comments are skipped, values
+/// may be quoted, and keys this gateway doesn't reload (e.g. IROH_RELAY_TOKEN) are ignored.
+fn read_config_file(path: &Path) -> Result<HashMap<String, String>> {
+    const KEYS: &[&str] = &["BACKEND_URL", "IROH_ROUTES", "IROH_ALLOW_CLIENTS", "IROH_ALLOW_PATHS"];
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut values = HashMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (key, value) = line
+            .split_once('=')
+            .with_context(|| format!("{}:{}: expected KEY=value", path.display(), n + 1))?;
+        let key = key.trim();
+        if !KEYS.contains(&key) {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        values.insert(key.to_string(), value.to_string());
+    }
+    Ok(values)
+}
+
+impl Ctx {
+    fn policy(&self) -> Arc<Policy> {
+        self.policy.read().unwrap().clone()
+    }
+}
+
+/// Re-reads `--config-file` on SIGHUP and swaps in the new routes and allow lists. Requests in
+/// flight finish with the config they started with; connections stay open.
+#[cfg(unix)]
+async fn reload_on_sighup(ctx: Arc<Ctx>, args: Args) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(hup) => hup,
+        Err(err) => return warn!("cannot listen for SIGHUP, config reload unavailable: {err}"),
+    };
+    while hup.recv().await.is_some() {
+        if args.config_file.is_none() {
+            warn!("SIGHUP received but there is nothing to reload: start with --config-file / IROH_CONFIG_FILE");
+            continue;
+        }
+        match Policy::load(&args) {
+            Ok(policy) => {
+                info!("configuration reloaded");
+                policy.log_config();
+                ctx.metrics.reloads.fetch_add(1, Ordering::Relaxed);
+                *ctx.policy.write().unwrap() = Arc::new(policy);
+            }
+            Err(err) => {
+                ctx.metrics.reload_failures.fetch_add(1, Ordering::Relaxed);
+                warn!("configuration reload failed, keeping the current one: {err:#}");
+            }
+        }
+    }
+}
+
+struct Ctx {
+    /// This gateway's endpoint id, returned as `X-Iroh-Gateway-Id` so clients with several
+    /// replicas can tell which one answered.
+    gateway_id: String,
+    http: reqwest::Client,
+    /// Routes and allow lists; replaced as a whole on reload, read as a snapshot per request.
+    policy: RwLock<Arc<Policy>>,
     max_body: usize,
     max_head: usize,
     max_ws_message: usize,
@@ -659,7 +762,7 @@ impl Upstreams {
 async fn handle_connection(ctx: Arc<Ctx>, conn: Connection) {
     let remote = conn.remote_id();
     // The id is only known once the handshake has verified it, so refuse right after.
-    if !ctx.allow_clients.is_empty() && !ctx.allow_clients.contains(&remote) {
+    if !ctx.policy().client_allowed(&remote) {
         warn!(remote = %remote.fmt_short(), "client not in allow list, closing connection");
         ctx.metrics.reject(Reject::ClientNotAllowed);
         conn.close(VarInt::from_u32(1), b"not allowed");
@@ -669,6 +772,13 @@ async fn handle_connection(ctx: Arc<Ctx>, conn: Connection) {
     let _connected = GaugeGuard::new(&ctx.metrics.connections);
     // Each request arrives on its own bidirectional stream, so requests run concurrently.
     while let Ok((mut send, recv)) = conn.accept_bi().await {
+        // A reload may have removed this client from the allow list since it connected.
+        if !ctx.policy().client_allowed(&remote) {
+            warn!(remote = %remote.fmt_short(), "client no longer in allow list, closing connection");
+            ctx.metrics.reject(Reject::ClientNotAllowed);
+            conn.close(VarInt::from_u32(1), b"not allowed");
+            break;
+        }
         let ctx = ctx.clone();
         let Ok(permit) = ctx.requests.clone().try_acquire_owned() else {
             if ctx.busy_log.allow() {
@@ -705,6 +815,8 @@ async fn with_limit<F: Future>(limit: Option<Duration>, fut: F) -> Option<F::Out
 }
 
 async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mut recv: RecvStream) -> Result<()> {
+    // The whole request uses the config that was current when it arrived, even across a reload.
+    let policy = ctx.policy();
     let mut out = Outcome::new(&ctx.metrics);
     let mut head: RequestHead = match with_limit(ctx.head_timeout, proto::read_head_limited(&mut recv, ctx.max_head)).await {
         Some(Ok(head)) => head,
@@ -730,11 +842,11 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mu
     let path = path_only(&head.path);
     // Routing and the allow list both look at the validated path. WebSockets get the same
     // checks, before any upstream is contacted.
-    if !ctx.allow_paths.is_empty() && !ctx.allow_paths.iter().any(|p| prefix_matches(p, path)) {
+    if !policy.allow_paths.is_empty() && !policy.allow_paths.iter().any(|p| prefix_matches(p, path)) {
         info!("{method} {} -> 403 (path not allowed)", path_for_log(&head.path));
         return reply(ctx, &mut out, send, Reject::PathNotAllowed, 403, "forbidden").await;
     }
-    let Some((route, upstreams)) = ctx.router.select(host.as_deref().map(normalize_host).as_deref(), path) else {
+    let Some((route, upstreams)) = policy.router.select(host.as_deref().map(normalize_host).as_deref(), path) else {
         info!("{method} {} -> 404 (no route for host {})", path_for_log(&head.path), host.as_deref().unwrap_or("-"));
         return reply(ctx, &mut out, send, Reject::NoRoute, 404, "no route for this host or path").await;
     };
@@ -1265,6 +1377,9 @@ struct Metrics {
     /// Histogram buckets, not cumulative; the last one is everything above the largest bound.
     durations: [AtomicU64; DURATION_BUCKETS.len() + 1],
     duration_sum_micros: AtomicU64,
+    /// Config reloads (SIGHUP) that were applied, and ones rejected for errors.
+    reloads: AtomicU64,
+    reload_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -1385,6 +1500,10 @@ fn render_metrics(router: &Router, metrics: &Metrics, inflight: usize) -> String
     let _ = writeln!(out, "# HELP iroh_gateway_connections Established client connections.");
     let _ = writeln!(out, "# TYPE iroh_gateway_connections gauge");
     let _ = writeln!(out, "iroh_gateway_connections {}", metrics.connections.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# HELP iroh_gateway_config_reloads_total Configuration reloads, by result.");
+    let _ = writeln!(out, "# TYPE iroh_gateway_config_reloads_total counter");
+    let _ = writeln!(out, "iroh_gateway_config_reloads_total{{result=\"ok\"}} {}", metrics.reloads.load(Ordering::Relaxed));
+    let _ = writeln!(out, "iroh_gateway_config_reloads_total{{result=\"error\"}} {}", metrics.reload_failures.load(Ordering::Relaxed));
     let _ = writeln!(out, "# HELP iroh_gateway_inflight_requests Requests and WebSockets in progress.");
     let _ = writeln!(out, "# TYPE iroh_gateway_inflight_requests gauge");
     let _ = writeln!(out, "iroh_gateway_inflight_requests {inflight}");
@@ -1514,7 +1633,7 @@ fn admin_response(admin: &Admin, method: &str, path: &str) -> (u16, &'static str
             (status, ADMIN_TEXT, body)
         }
         "/status" => (200, "application/json", admin.status().to_string()),
-        _ => (200, "text/plain; version=0.0.4; charset=utf-8", render_metrics(&admin.ctx.router, &admin.ctx.metrics, admin.inflight())),
+        _ => (200, "text/plain; version=0.0.4; charset=utf-8", render_metrics(&admin.ctx.policy().router, &admin.ctx.metrics, admin.inflight())),
     }
 }
 
@@ -1541,7 +1660,8 @@ impl Admin {
         if !self.online() {
             problems.push_str("endpoint offline\n");
         }
-        for (label, upstreams) in self.ctx.router.all() {
+        let policy = self.ctx.policy();
+        for (label, upstreams) in policy.router.all() {
             let health = upstreams.health();
             if health.iter().any(Option::is_none) {
                 continue;
@@ -1566,8 +1686,8 @@ impl Admin {
             .iter()
             .map(|r| json!({ "url": r.url().to_string(), "connected": r.is_connected(), "last_error": r.last_error().map(|e| e.to_string()) }))
             .collect();
-        let routes: Vec<_> = self
-            .ctx
+        let policy = self.ctx.policy();
+        let routes: Vec<_> = policy
             .router
             .all()
             .map(|(label, upstreams)| {
@@ -1878,6 +1998,46 @@ mod tests {
             let base = name.trim_end_matches("_bucket").trim_end_matches("_sum").trim_end_matches("_count");
             assert!(text.contains(&format!("# TYPE {base} ")), "{line}");
         }
+    }
+
+    #[test]
+    fn config_file_overrides_flags_and_rejects_bad_values() {
+        let dir = std::env::temp_dir().join(format!("iroh-gateway-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gateway.env");
+        let args = Args::parse_from([
+            "iroh-gateway",
+            "--backend",
+            "http://127.0.0.1:1",
+            "--allow-path",
+            "/flag",
+            "--config-file",
+            path.to_str().unwrap(),
+        ]);
+        let id = SecretKey::generate().public();
+        std::fs::write(
+            &path,
+            format!(
+                "# comment\nIROH_RELAY_TOKEN=ignored\nexport BACKEND_URL=\"http://127.0.0.1:2\"\n\
+                 IROH_ROUTES='/api=http://127.0.0.1:3;files.example.com=http://127.0.0.1:4'\nIROH_ALLOW_CLIENTS={id}\n"
+            ),
+        )
+        .unwrap();
+        let policy = Policy::load(&args).unwrap();
+        assert_eq!(policy.router.default.as_ref().unwrap().urls, ["http://127.0.0.1:2"]);
+        assert_eq!(policy.router.select(None, "/api/x").map(|r| r.0), Some("/api"));
+        assert_eq!(policy.router.select(Some("files.example.com"), "/").map(|r| r.0), Some("files.example.com"));
+        assert!(policy.client_allowed(&id));
+        assert!(!policy.client_allowed(&SecretKey::generate().public()));
+        // Keys missing from the file keep their flag value.
+        assert_eq!(policy.allow_paths, ["/flag"]);
+
+        std::fs::write(&path, "IROH_ALLOW_CLIENTS=not-an-id\n").unwrap();
+        assert!(Policy::load(&args).is_err());
+        std::fs::write(&path, "no equals sign\n").unwrap();
+        assert!(Policy::load(&args).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(Policy::load(&args).is_err(), "a missing file is an error, not an empty config");
     }
 
     #[test]

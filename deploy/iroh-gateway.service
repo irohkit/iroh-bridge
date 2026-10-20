@@ -10,7 +10,12 @@ User=iroh-gateway
 Environment=BACKEND_URL=http://127.0.0.1:8080
 Environment=IROH_KEY_FILE=/var/lib/iroh-gateway/key
 Environment=RUST_LOG=iroh_gateway=info
+# Optional: settings that `systemctl reload iroh-gateway` re-reads (see README, "Changing routes and
+# allow lists without a restart"). Also loaded as environment at start.
+#EnvironmentFile=/etc/iroh-gateway.env
+#Environment=IROH_CONFIG_FILE=/etc/iroh-gateway.env
 ExecStart=/usr/local/bin/iroh-gateway
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2
 # SIGTERM shuts the gateway down cleanly; give it a moment to close its connections.

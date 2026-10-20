@@ -79,6 +79,9 @@ struct Args {
     /// Use your own relay server instead of the public n0 relays (recommended for production).
     #[arg(long, env = "IROH_RELAY_URL")]
     relay_url: Option<RelayUrl>,
+    /// Token for a relay that only admits clients with a token (iroh-relay `access.shared_token`).
+    #[arg(long, env = "IROH_RELAY_TOKEN", hide_env_values = true, requires = "relay_url")]
+    relay_token: Option<String>,
     /// Maximum request body size in bytes.
     #[arg(long, env = "MAX_BODY_BYTES", default_value_t = 32 * 1024 * 1024)]
     max_body: usize,
@@ -159,7 +162,11 @@ async fn main() -> Result<()> {
         .alpns(vec![ALPN.to_vec()])
         .transport_config(transport);
     if let Some(url) = args.relay_url.clone() {
-        builder = builder.relay_mode(RelayMode::Custom(url.into()));
+        let mut relay = iroh::RelayConfig::from(url);
+        if let Some(token) = args.relay_token.clone() {
+            relay = relay.with_auth_token(token);
+        }
+        builder = builder.relay_mode(RelayMode::Custom(relay.into()));
     }
     let endpoint = builder.bind().await?;
     endpoint.online().await;

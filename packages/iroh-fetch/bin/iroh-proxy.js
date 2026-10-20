@@ -27,7 +27,8 @@ Options:
                           ("*" = any). By default only pages served from the proxy itself
                           or from localhost may, so other sites can't use your gateway
                           access (cross-site requests and WebSockets).
-  --relay-url <url>       Relay URL, only needed when the gateway uses a custom relay
+  --relay-url <url>       Your own relay (the gateway should use the same one)
+  --relay-token <token>   Token for a relay that requires one (or env IROH_RELAY_TOKEN)
   --connect-timeout <ms>  How long to wait for the gateway (default 15000, 0 = forever)
   -h, --help              Show this help
 
@@ -93,7 +94,7 @@ async function main() {
   let iroh;
   try {
     // cookies: false keeps the proxy transparent: the real client keeps its own cookie jar.
-    iroh = await createIrohFetch({ endpointIds, relayUrl: values["relay-url"], connectTimeout, cookies: false });
+    iroh = await createIrohFetch({ endpointIds, relayUrl: values["relay-url"], relayToken: values["relay-token"] ?? process.env.IROH_RELAY_TOKEN, connectTimeout, cookies: false });
   } catch (err) {
     fail(err?.message ?? String(err));
   }
@@ -174,6 +175,7 @@ function parseCli() {
         "allow-host": { type: "string", default: "" },
         "allow-origin": { type: "string", default: "" },
         "relay-url": { type: "string" },
+        "relay-token": { type: "string" },
         "connect-timeout": { type: "string", default: "15000" },
         help: { type: "boolean", short: "h" },
       },

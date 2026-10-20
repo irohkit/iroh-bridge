@@ -21,6 +21,7 @@ export function makeCreate(init) {
   return async function createIrohFetch(options) {
     const {
       relayUrl,
+      relayToken,
       logLevel,
       connect = true,
       connectTimeout = 15_000,
@@ -33,7 +34,8 @@ export function makeCreate(init) {
     await init();
     if (logLevel) enableLogging(logLevel);
     // One local endpoint serves every gateway; each gateway gets its own connection.
-    const client = await IrohClient.create(relayUrl ?? undefined);
+    if (relayToken && !relayUrl) throw new Error("iroh-fetch: relayToken needs relayUrl");
+    const client = await IrohClient.create(relayUrl ?? undefined, relayToken ?? undefined);
 
     const storage = persistCookies ? (persistCookies === true ? globalThis.localStorage : persistCookies) : undefined;
     for (const b of backends) {
@@ -225,10 +227,16 @@ async function withFailover(b, attempt, retryable = () => true) {
 
 function connectWithTimeout(client, r, ms) {
   const id = r.endpointId;
+  // The relay's own complaint (e.g. a refused relay token) explains a failure better than a timeout.
+  const relayHint = () => {
+    const problem = client.relayProblem?.();
+    return problem ? ` (${problem})` : "";
+  };
   return withTimeout(client.connect(id), ms, () =>
     new DOMException(
       `iroh-fetch: could not reach gateway ${id.slice(0, 10)}… within ${ms} ms ` +
-        "(is iroh-gateway running, and is the endpoint id right?)",
+        "(is iroh-gateway running, and is the endpoint id right?)" +
+        relayHint(),
       "TimeoutError",
     ),
   ).then(
@@ -241,7 +249,7 @@ function connectWithTimeout(client, r, ms) {
       if (err?.name === "TimeoutError") throw err;
       throw new Error(
         `iroh-fetch: could not connect to gateway ${id.slice(0, 10)}… ` +
-          `(is iroh-gateway running, and is the endpoint id right?): ${err?.message ?? err}`,
+          `(is iroh-gateway running, and is the endpoint id right?): ${err?.message ?? err}${relayHint()}`,
         { cause: err },
       );
     },

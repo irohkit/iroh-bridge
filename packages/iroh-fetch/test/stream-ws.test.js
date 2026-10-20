@@ -8,7 +8,7 @@ const opts = { skip: !endpointId, timeout: 60_000 };
 let iroh;
 
 before(async () => {
-  if (endpointId) iroh = await createIrohFetch({ endpointId, relayUrl: process.env.IROH_RELAY_URL });
+  if (endpointId) iroh = await createIrohFetch({ endpointId, relayUrl: process.env.IROH_RELAY_URL, relayToken: process.env.IROH_RELAY_TOKEN });
 });
 after(() => iroh?.close());
 

@@ -6,7 +6,7 @@ import { createIrohFetch } from "iroh-fetch";
 const endpointId = process.env.IROH_ENDPOINT_ID;
 
 test("GET and POST through the gateway", { skip: !endpointId, timeout: 60_000 }, async () => {
-  const iroh = await createIrohFetch({ endpointId, relayUrl: process.env.IROH_RELAY_URL });
+  const iroh = await createIrohFetch({ endpointId, relayUrl: process.env.IROH_RELAY_URL, relayToken: process.env.IROH_RELAY_TOKEN });
   try {
     const get = await iroh.fetch("/hello?x=1");
     assert.equal(get.status, 200);

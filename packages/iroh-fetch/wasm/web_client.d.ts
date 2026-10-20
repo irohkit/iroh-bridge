@@ -50,13 +50,19 @@ export class IrohClient {
     connect(remote: string): Promise<any>;
     /**
      * Create a local endpoint that can talk to any number of gateways.
-     * `relay_url` must match the gateways' relay if they use a custom one.
+     * `relay_url` must match the gateways' relay if they use a custom one; `relay_token` is
+     * for relays that only admit clients with a token.
      */
-    static create(relay_url?: string | null): Promise<IrohClient>;
+    static create(relay_url?: string | null, relay_token?: string | null): Promise<IrohClient>;
     /**
      * This client's own endpoint id.
      */
     endpointId(): string;
+    /**
+     * Why the home relay can't be used, if it can't: e.g. it refused the relay token. `None`
+     * while the relay is fine or nothing has failed yet.
+     */
+    relayProblem(): string | undefined;
     /**
      * Send one HTTP request. `headers` is an array of `[name, value]` pairs and `body` is
      * `undefined`, a `Uint8Array`, or a `ReadableStream<Uint8Array>` that is uploaded as it is read.
@@ -117,13 +123,14 @@ export interface InitOutput {
     readonly intounderlyingsink_abort: (a: number, b: any) => any;
     readonly intounderlyingsink_close: (a: number) => any;
     readonly intounderlyingsink_write: (a: number, b: any) => any;
-    readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly intounderlyingsource_cancel: (a: number) => void;
+    readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly intounderlyingsource_pull: (a: number, b: any) => any;
     readonly irohclient_close: (a: number) => any;
     readonly irohclient_connect: (a: number, b: number, c: number) => any;
-    readonly irohclient_create: (a: number, b: number) => any;
+    readonly irohclient_create: (a: number, b: number, c: number, d: number) => any;
     readonly irohclient_endpointId: (a: number) => [number, number];
+    readonly irohclient_relayProblem: (a: number) => [number, number];
     readonly irohclient_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: any, i: any) => any;
     readonly irohclient_websocket: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
     readonly start: () => void;
@@ -134,8 +141,8 @@ export interface InitOutput {
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___js_sys_7533570554f6805f___Function_fn_wasm_bindgen_e1363021040f656a___JsValue_____wasm_bindgen_e1363021040f656a___sys__Undefined___js_sys_7533570554f6805f___Function_fn_wasm_bindgen_e1363021040f656a___JsValue_____wasm_bindgen_e1363021040f656a___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_e1363021040f656a___JsError___true_: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true_: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__25: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__26: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__27: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke_______true_: (a: number, b: number) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke_______true__1_: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;

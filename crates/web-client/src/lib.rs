@@ -46,15 +46,35 @@ pub struct IrohClient(Rc<Inner>);
 #[wasm_bindgen]
 impl IrohClient {
     /// Create a local endpoint that can talk to any number of gateways.
-    /// `relay_url` must match the gateways' relay if they use a custom one.
-    pub async fn create(relay_url: Option<String>) -> Result<IrohClient, JsError> {
+    /// `relay_url` must match the gateways' relay if they use a custom one; `relay_token` is
+    /// for relays that only admit clients with a token.
+    pub async fn create(relay_url: Option<String>, relay_token: Option<String>) -> Result<IrohClient, JsError> {
         let mut builder = Endpoint::builder(presets::N0);
         if let Some(url) = relay_url.filter(|u| !u.is_empty()) {
             let url: RelayUrl = url.parse().context("invalid relay url").map_err(js)?;
-            builder = builder.relay_mode(RelayMode::Custom(url.into()));
+            let mut relay = iroh::RelayConfig::from(url);
+            // In the browser this travels as `?token=` on the relay WebSocket URL.
+            if let Some(token) = relay_token.filter(|t| !t.is_empty()) {
+                relay = relay.with_auth_token(token);
+            }
+            builder = builder.relay_mode(RelayMode::Custom(relay.into()));
         }
         let endpoint = builder.bind().await.map_err(js)?;
         Ok(IrohClient(Rc::new(Inner { endpoint, conns: Default::default() })))
+    }
+
+    /// Why the home relay can't be used, if it can't: e.g. it refused the relay token. `None`
+    /// while the relay is fine or nothing has failed yet.
+    #[wasm_bindgen(js_name = relayProblem)]
+    pub fn relay_problem(&self) -> Option<String> {
+        use iroh::Watcher;
+        let statuses = self.0.endpoint.home_relay_status().get();
+        statuses.iter().find_map(|status| {
+            if let Some(reason) = status.auth_denied_reason() {
+                return Some(format!("relay {} refused this client: {reason}", status.url()));
+            }
+            status.last_error().map(|err| format!("relay {} is unreachable: {err}", status.url()))
+        })
     }
 
     /// This client's own endpoint id.

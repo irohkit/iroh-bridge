@@ -8,7 +8,7 @@ const IrohContext = createContext(null);
  */
 export function IrohProvider({ children, install, ...options }) {
   const [state, setState] = useState({ status: "connecting", client: null, error: null });
-  const deps = [options.endpointId, JSON.stringify(options.backends ?? null), options.relayUrl, options.connectTimeout, JSON.stringify(install ?? null)];
+  const deps = [options.endpointId, JSON.stringify(options.backends ?? null), options.relayUrl, options.relayToken, options.connectTimeout, JSON.stringify(install ?? null)];
 
   // Requests made before the connection is ready wait for it instead of failing.
   const ready = useMemo(() => {

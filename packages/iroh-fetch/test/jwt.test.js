@@ -10,7 +10,7 @@ const API = "https://api.example.com";
 let iroh;
 
 before(async () => {
-  if (endpointId) iroh = await createIrohFetch({ backends: { [API]: endpointId }, relayUrl: process.env.IROH_RELAY_URL });
+  if (endpointId) iroh = await createIrohFetch({ backends: { [API]: endpointId }, relayUrl: process.env.IROH_RELAY_URL, relayToken: process.env.IROH_RELAY_TOKEN });
 });
 after(() => iroh?.close());
 

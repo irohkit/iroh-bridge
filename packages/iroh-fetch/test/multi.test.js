@@ -21,7 +21,8 @@ function deadId() {
 }
 
 async function create(options) {
-  const c = await createIrohFetch({ connectTimeout: 4000, ...options });
+  const relay = process.env.IROH_RELAY_URL ? { relayUrl: process.env.IROH_RELAY_URL, relayToken: process.env.IROH_RELAY_TOKEN } : {};
+  const c = await createIrohFetch({ connectTimeout: 4000, ...relay, ...options });
   clients.push(c);
   return c;
 }

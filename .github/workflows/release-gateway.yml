@@ -26,8 +26,8 @@ permissions:
   contents: read
 
 env:
-  # Asset names carry the tag; untagged builds are called "dev".
-  TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || 'dev' }}
+  # Asset names carry the tag; untagged builds are called v0.0.0-dev (the installers expect a v prefix).
+  TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || 'v0.0.0-dev' }}
 
 jobs:
   build:

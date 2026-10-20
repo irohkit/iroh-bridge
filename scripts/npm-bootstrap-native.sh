@@ -40,7 +40,23 @@ mkdir "$work/src" && git archive "v$version" | tar -x -C "$work/src"
 (cd "$work/src" && node scripts/native-packages.mjs "$work/prebuilds" "$work/npm")
 
 echo "==> npm login"
-npm whoami >/dev/null 2>&1 || npm login --auth-type=web
+# npm's web login, done with curl: `npm login` can crash ("Exit handler never called") when it
+# falls back to prompting. Open the printed link, sign in and approve; the token goes to ~/.npmrc.
+if ! npm whoami >/dev/null 2>&1; then
+  start=$(curl -4 -sf -X POST -H 'content-type: application/json' -H 'npm-auth-type: web' \
+    -H 'npm-command: login' -d '{}' https://registry.npmjs.org/-/v1/login)
+  login_url=$(printf '%s' "$start" | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0)).loginUrl)')
+  done_url=$(printf '%s' "$start" | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0)).doneUrl)')
+  printf '\nOpen this link, sign in to npm and approve (it expires after about 5 minutes):\n\n  %s\n\n' "$login_url"
+  while :; do
+    code=$(curl -4 -s -o "$work/done.json" -w '%{http_code}' "$done_url")
+    [ "$code" = 200 ] && break
+    [ "$code" = 202 ] || { echo "login link expired or was declined (HTTP $code); run the script again"; exit 1; }
+    sleep 2
+  done
+  npm config set //registry.npmjs.org/:_authToken "$(node -p 'require(process.argv[1]).token' "$work/done.json")" >/dev/null
+  rm -f "$work/done.json"
+fi
 echo "logged in as $(npm whoami)"
 
 names=()

@@ -139,8 +139,11 @@ export function makeCreate(init) {
     };
 
     const root = api(null);
+    const hosts = backends.map((b) => b.host).filter(Boolean);
     return {
       ...root,
+      serviceWorker: (opts) => registerServiceWorker(root.fetch, opts?.hosts ?? hosts, opts),
+      proxyUrl: (url) => proxyUrl(url, hosts),
       /** Scope everything to one backend, so path-only URLs go there: `iroh.backend("https://files.example.com")`. */
       backend(origin) {
         const host = new URL(origin).host;
@@ -466,6 +469,68 @@ function install(impl, { origins = [], match, websocket = true, eventSource = tr
       else delete globalThis.EventSource;
     }
   };
+}
+
+/**
+ * Registers the service worker (src/sw.js, served from your origin) so the browser's own loads of
+ * backend URLs (<img>, <video>, CSS, fonts, downloads) go over iroh, and answers its requests.
+ */
+async function registerServiceWorker(irohFetch, hosts, { url = "/iroh-sw.js", scope } = {}) {
+  const sw = globalThis.navigator?.serviceWorker;
+  if (!sw) throw new Error("iroh-fetch: service workers are not available here (they need https or localhost)");
+  if (!hosts.length) throw new Error("iroh-fetch: serviceWorker() needs backends with origins, or { hosts }");
+
+  const onMessage = (event) => {
+    if (event.data?.type === "iroh-fetch:request" && event.ports[0]) serveForWorker(irohFetch, event.data, event.ports[0]);
+  };
+  sw.addEventListener("message", onMessage);
+  sw.startMessages?.();
+  const registration = await sw.register(`${url}?hosts=${encodeURIComponent(hosts.join(","))}`, scope ? { scope } : undefined);
+  await sw.ready;
+  // The worker claims open pages when it activates; wait for that so the first images already work.
+  if (!sw.controller) await new Promise((resolve) => sw.addEventListener("controllerchange", resolve, { once: true }));
+  return {
+    registration,
+    async unregister() {
+      sw.removeEventListener("message", onMessage);
+      await registration.unregister();
+    },
+  };
+}
+
+/** Sends one request for the service worker and streams the response back, a chunk per pull. */
+async function serveForWorker(irohFetch, req, port) {
+  let reader;
+  port.onmessage = async ({ data }) => {
+    try {
+      if (data.type === "cancel") return void reader?.cancel();
+      if (data.type !== "pull" || !reader) return;
+      const { value, done } = await reader.read();
+      if (done) port.postMessage({ type: "end" });
+      else {
+        const chunk = value.buffer.byteLength === value.byteLength ? value.buffer : value.slice().buffer;
+        port.postMessage({ type: "chunk", chunk }, [chunk]);
+      }
+    } catch (err) {
+      port.postMessage({ type: "error", message: String(err?.message ?? err) });
+    }
+  };
+  try {
+    const res = await irohFetch(req.url, { method: req.method, headers: req.headers, body: req.body, redirect: req.redirect });
+    reader = res.body?.getReader();
+    port.postMessage({ type: "head", status: res.status, statusText: res.statusText, headers: [...res.headers] });
+    if (!reader) port.postMessage({ type: "end" });
+  } catch (err) {
+    port.postMessage({ type: "error", message: String(err?.message ?? err) });
+  }
+}
+
+/** A same-origin URL for a backend URL, for links the browser opens itself (downloads, new tabs). */
+function proxyUrl(input, hosts) {
+  const url = new URL(String(input));
+  if (!hosts.includes(url.host)) throw new TypeError(`iroh-fetch: no backend configured for ${url.origin}`);
+  const base = new URL("__iroh__/", globalThis.location?.href ?? DEFAULT_ORIGIN);
+  return `${base.href}${url.host}${url.pathname}${url.search}`;
 }
 
 /** Accepts a path, an absolute http(s)/ws(s) URL or a URL object; only path + query reach the backend. */

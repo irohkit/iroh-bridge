@@ -8,6 +8,11 @@ export interface IrohProviderProps extends Partial<IrohFetchOptions> {
    * code and libraries (SWR, React Query, axios with the fetch adapter...) work unchanged.
    */
   install?: boolean | InstallOptions;
+  /**
+   * Register the iroh service worker (serve node_modules/iroh-fetch/src/sw.js at /iroh-sw.js) so
+   * <img>, <video>, CSS and downloads of backend URLs work too. `true` or `{ url, scope }`.
+   */
+  serviceWorker?: boolean | { url?: string; scope?: string };
 }
 
 export type IrohState =

@@ -4,7 +4,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "predev": "cp node_modules/iroh-fetch/src/sw.js public/iroh-sw.js",
+    "prebuild": "cp node_modules/iroh-fetch/src/sw.js public/iroh-sw.js"
   },
   "dependencies": {
     "iroh-fetch": "file:../../packages/iroh-fetch",

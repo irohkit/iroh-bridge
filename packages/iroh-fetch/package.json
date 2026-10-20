@@ -27,7 +27,8 @@
     "./react": {
       "types": "./src/react.d.ts",
       "default": "./src/react.js"
-    }
+    },
+    "./sw.js": "./src/sw.js"
   },
   "bin": {
     "iroh-proxy": "bin/iroh-proxy.js"

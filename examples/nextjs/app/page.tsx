@@ -62,7 +62,7 @@ function SelfTest({ disabled }: { disabled: boolean }) {
       const started = performance.now();
       let result: Result;
       try {
-        const detail = await check.run({ endpointId: iroh.client.endpointId });
+        const detail = await check.run({ endpointId: iroh.client.endpointId, client: iroh.client });
         result = { name: check.name, ok: true, detail, ms: performance.now() - started };
       } catch (e) {
         result = { name: check.name, ok: false, detail: e instanceof Error ? e.message : String(e), ms: performance.now() - started };

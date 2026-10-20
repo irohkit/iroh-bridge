@@ -6,9 +6,9 @@ const IrohContext = createContext(null);
 /**
  * @param {import("./react.d.ts").IrohProviderProps} props
  */
-export function IrohProvider({ children, install, ...options }) {
+export function IrohProvider({ children, install, serviceWorker, ...options }) {
   const [state, setState] = useState({ status: "connecting", client: null, error: null });
-  const deps = [options.endpointId, JSON.stringify(options.backends ?? null), options.relayUrl, options.relayToken, options.connectTimeout, JSON.stringify(install ?? null)];
+  const deps = [options.endpointId, JSON.stringify(options.backends ?? null), options.relayUrl, options.relayToken, options.connectTimeout, JSON.stringify(install ?? null), JSON.stringify(serviceWorker ?? null)];
 
   // Requests made before the connection is ready wait for it instead of failing.
   const ready = useMemo(() => {
@@ -32,10 +32,13 @@ export function IrohProvider({ children, install, ...options }) {
     // Imported lazily so the WASM only ever loads in the browser, never during SSR.
     import("./browser.js")
       .then(({ createIrohFetch }) => createIrohFetch(options))
-      .then((c) => {
+      .then(async (c) => {
         client = c;
         if (cancelled) return c.close();
         if (install) uninstall = c.install(install === true ? undefined : install);
+        // Report ready only once the worker controls the page, so the first <img> already loads.
+        if (serviceWorker) await c.serviceWorker(serviceWorker === true ? undefined : serviceWorker);
+        if (cancelled) return;
         setState({ status: "ready", client: c, error: null });
         ready.resolve(c);
       })

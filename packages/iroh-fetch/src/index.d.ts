@@ -115,6 +115,20 @@ export interface IrohFetch {
   EventSource: { new (url: string | URL, init?: EventSourceInit & { headers?: HeadersInit }): EventSource };
   /** `new iroh.XMLHttpRequest()`: the standard XHR (incl. upload/download progress), over iroh. */
   XMLHttpRequest: { new (): XMLHttpRequest };
+  /**
+   * Register the service worker so the browser's own loads of backend URLs (<img>, <video>, CSS,
+   * fonts) go over iroh. Serve `node_modules/iroh-fetch/src/sw.js` from your origin at `url`
+   * (default "/iroh-sw.js"). Resolves once the worker controls the page.
+   */
+  serviceWorker(options?: { url?: string; scope?: string; hosts?: string[] }): Promise<{
+    registration: ServiceWorkerRegistration;
+    unregister(): Promise<void>;
+  }>;
+  /**
+   * A same-origin URL that the service worker routes to `url` on a backend, for links the browser
+   * opens itself (downloads, "open in new tab"), which a service worker can't catch cross-origin.
+   */
+  proxyUrl(url: string | URL): string;
   /** This client's secret key (hex): pass it as `secretKey` later to keep the same endpoint id. */
   exportSecretKey(): string;
   /**

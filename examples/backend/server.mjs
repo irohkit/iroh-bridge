@@ -137,6 +137,19 @@ async function handle(req, res) {
     return res.end();
   }
 
+  // Resources the browser loads by itself (<img>, downloads), for the service worker demo.
+  if (req.url?.startsWith("/image.svg")) {
+    res.writeHead(200, { "content-type": "image/svg+xml", "cache-control": "no-store" });
+    return res.end(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">` +
+        `<rect width="96" height="96" rx="16" fill="#3b82f6"/><text x="48" y="58" font-size="28" text-anchor="middle" fill="#fff" font-family="sans-serif">${name}</text></svg>`,
+    );
+  }
+  if (req.url?.startsWith("/download")) {
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-disposition": 'attachment; filename="report.txt"' });
+    return res.end(`report from backend ${name}\n`);
+  }
+
   // Answers after a delay, to try timeouts and aborts.
   if (req.url?.startsWith("/slow")) {
     await sleep(3000);

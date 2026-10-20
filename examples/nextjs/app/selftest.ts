@@ -2,7 +2,9 @@
 // EventSource, WebSocket), which iroh-fetch routes over iroh for the configured origins.
 import { API, FILES } from "../iroh.config";
 
-export type Check = { name: string; run: (ctx: { endpointId: string }) => Promise<string> };
+import type { IrohFetch } from "iroh-fetch";
+
+export type Check = { name: string; run: (ctx: { endpointId: string; client: IrohFetch }) => Promise<string> };
 
 function assert(ok: unknown, message: string): asserts ok {
   if (!ok) throw new Error(message);
@@ -183,6 +185,44 @@ export const checks: Check[] = [
       const data = await json(`${API}/upload`, { method: "POST", body: new Blob([bytes]) });
       assert(data.bytes === bytes.length && data.sha256 === sha, JSON.stringify(data));
       return `${(data.bytes / 1024 / 1024).toFixed(0)} MB ok`;
+    },
+  },
+  {
+    name: "XMLHttpRequest (axios's browser default) with upload progress",
+    run: () =>
+      new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        let progress = 0;
+        xhr.open("POST", `${API}/upload`);
+        xhr.responseType = "json";
+        xhr.upload.onprogress = () => progress++;
+        xhr.onload = () =>
+          xhr.status === 200 && xhr.response.bytes === 1024 * 1024 && progress > 1
+            ? resolve(`200, ${progress} progress events`)
+            : reject(new Error(`${xhr.status} ${JSON.stringify(xhr.response)} progress=${progress}`));
+        xhr.onerror = () => reject(new Error("xhr error"));
+        xhr.send(new Blob([new Uint8Array(1024 * 1024)]));
+      }),
+  },
+  {
+    name: "<img src> from a backend (service worker)",
+    run: () =>
+      new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => (img.naturalWidth === 96 ? resolve(`${img.naturalWidth}×${img.naturalHeight}`) : reject(new Error(`${img.naturalWidth}`)));
+        img.onerror = () => reject(new Error("image failed to load"));
+        img.src = `${FILES}/image.svg?t=${Date.now()}`;
+      }),
+  },
+  {
+    name: "Download link via proxyUrl (service worker)",
+    run: async ({ client }) => {
+      const url = client.proxyUrl(`${API}/download`);
+      // A plain same-origin request, as a browser download or new tab would make.
+      const res = await window.fetch(url);
+      const text = await res.text();
+      assert(res.ok && text.startsWith("report from backend A"), `${res.status} ${text}`);
+      return `${res.headers.get("content-disposition")}`;
     },
   },
   {

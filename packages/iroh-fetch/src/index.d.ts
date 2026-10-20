@@ -57,10 +57,21 @@ export interface IrohFetchOptions {
   relayUrl?: string | string[];
   /**
    * Token for a relay that only admits clients with a token (iroh-relay `access.shared_token`).
-   * In a public web page the token is visible to anyone, so it limits who uses your relay's
-   * bandwidth, not who reaches your backend; authenticate users in the backend for that.
+   * Prefer a function that gets it from your backend at runtime (e.g. only for logged-in users):
+   * `relayToken: () => fetch("/api/relay-token").then((r) => r.text())`. It is called before the
+   * client is created, again whenever the relay refuses the client (then the dial is retried once),
+   * on `refreshRelayToken()` and every `relayTokenRefreshMs`. A token that differs from the current
+   * one replaces the underlying client: same endpoint id, cookies and cache, but open WebSockets,
+   * streams and in-flight requests are cut. A token string in a web page is visible to anyone, so it
+   * limits who uses your relay's bandwidth, not who reaches your backend; authenticate users in the
+   * backend for that.
    */
-  relayToken?: string;
+  relayToken?: string | (() => string | Promise<string>);
+  /**
+   * With a `relayToken` function: call it every this many ms (default 0: only when the relay
+   * refuses the client), so a rotated token is picked up before a reconnect to the relay needs it.
+   */
+  relayTokenRefreshMs?: number;
   /** Print iroh logs to the console: "error" | "warn" | "info" | "debug" | "trace". */
   logLevel?: string;
   /**
@@ -172,6 +183,12 @@ export interface IrohFetch {
   exportSecretKey(): string;
   /** Empties the HTTP cache (the `cache` option), e.g. on logout. */
   clearCache(): Promise<void>;
+  /**
+   * Calls the `relayToken` function now. If the token changed, closes the underlying client and
+   * creates a new one with it (same endpoint id; open WebSockets and streams are cut) and resolves
+   * true; otherwise (same token, a string `relayToken`, or closed) resolves false.
+   */
+  refreshRelayToken(): Promise<boolean>;
   /**
    * Route the global fetch (and WebSocket / EventSource / XMLHttpRequest) for matching URLs through iroh, so existing
    * code and libraries work unchanged. Returns a function that undoes it.

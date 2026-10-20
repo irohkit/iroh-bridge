@@ -15,6 +15,8 @@ const DEFAULT_ORIGIN = "http://iroh.invalid";
 const DEFAULT_HOST = "iroh.invalid";
 // URL schemes install() may route; anything else (data:, blob:, file:, ...) is never sent to a gateway.
 const ROUTABLE_PROTOCOLS = new Set(["http:", "https:", "ws:", "wss:"]);
+// client.relayProblem() when the relay rejected the relay token.
+const RELAY_REFUSED = /refused this client|not authori[sz]ed/i;
 
 /**
  * @param {() => Promise<void>} init loads the WASM module for the current runtime
@@ -25,6 +27,7 @@ export function makeCreate(init) {
     const {
       relayUrl,
       relayToken,
+      relayTokenRefreshMs = 0,
       secretKey,
       persistIdentity = false,
       logLevel,
@@ -52,16 +55,83 @@ export function makeCreate(init) {
     } catch {}
     // Several relays (e.g. your own plus "n0" as a fallback) arrive as one comma-separated list.
     const relays = Array.isArray(relayUrl) ? relayUrl.join(",") : relayUrl;
-    const client = await impl.IrohClient.create(relays || undefined, relayToken ?? undefined, secretKey ?? storedKey ?? undefined);
+    // relayToken may be a function (e.g. asking your backend), called now, again when the relay
+    // refuses the client, on refreshRelayToken() and every relayTokenRefreshMs.
+    const tokenSource = typeof relayToken === "function" ? relayToken : null;
+    const getToken = async () => {
+      const t = tokenSource ? await tokenSource() : relayToken;
+      return t == null || t === "" ? undefined : String(t);
+    };
+    let token = await getToken();
+    const first = await impl.IrohClient.create(relays || undefined, token, secretKey ?? storedKey ?? undefined);
+    // A refreshed token needs a new underlying client; it reuses this key, so the endpoint id stays.
+    const ownKey = first.secretKey();
+    const ownId = first.endpointId();
     if (idStore && !storedKey && !secretKey) {
       try {
-        idStore.setItem(idKey, client.secretKey());
+        idStore.setItem(idKey, ownKey);
       } catch {}
     }
+    let closed = false;
+    let current = Promise.resolve(first);
+    let live = first; // null while being replaced
+    let generation = 0;
+    // Everything below talks to this stand-in, which forwards to whichever client is current.
+    const client = {
+      connect: (...a) => current.then((c) => c.connect(...a)),
+      request: (...a) => current.then((c) => c.request(...a)),
+      websocket: (...a) => current.then((c) => c.websocket(...a)),
+      relayProblem: () => live?.relayProblem?.(),
+      endpointId: () => ownId,
+      secretKey: () => ownKey,
+      close: () => current.then((c) => c.close(), () => {}),
+    };
+    let refreshing = null;
+    /** Asks relayToken() again; with a new token, replaces the client (closing the old one). */
+    const refreshRelayToken = () =>
+      (refreshing ??= (async () => {
+        try {
+          if (!tokenSource || closed) return false;
+          const next = await getToken();
+          if (closed || (live && next === token)) return false;
+          // Close first: two endpoints with the same key would fight over the relay.
+          const old = current;
+          live = null;
+          current = old.then((c) => c.close()).catch(() => {}).then(() => impl.IrohClient.create(relays || undefined, next, ownKey));
+          generation++;
+          const c = await current;
+          token = next;
+          live = c;
+          // Connections died with the old client: dial again on next use, without a cooldown.
+          for (const b of backends) for (const r of b.replicas) Object.assign(r, { connected: false, downUntil: 0 }).reset?.();
+          return true;
+        } finally {
+          refreshing = null;
+        }
+      })());
+    // Dials one replica; if the relay refused our token, gets a new one and dials once more.
+    const dial = async (r) => {
+      const gen = generation;
+      try {
+        return await connectWithTimeout(client, r, connectTimeout);
+      } catch (err) {
+        if (closed) throw err;
+        // Refused, or a failed replacement left no client: try (again) with a fresh token.
+        const stale = gen === generation && (!live || RELAY_REFUSED.test(client.relayProblem() ?? ""));
+        const refreshed = stale && (await refreshRelayToken().catch(() => false));
+        // Also dial again if another dial replaced the client meanwhile.
+        if (gen === generation && !refreshed) throw err;
+        return connectWithTimeout(client, r, connectTimeout);
+      }
+    };
 
     const storage = persistCookies ? (persistCookies === true ? globalThis.localStorage : persistCookies) : undefined;
-    let closed = false;
     const timers = new Set();
+    if (tokenSource && relayTokenRefreshMs > 0) {
+      const t = setInterval(() => refreshRelayToken().catch(() => {}), relayTokenRefreshMs);
+      t.unref?.();
+      timers.add(t); // cleared with clearTimeout, which also clears intervals
+    }
     for (const b of backends) {
       // One jar per backend, shared by its replicas, so a session survives a failover.
       b.jar = cookies ? new CookieJar(storage && { storage, key: `iroh-fetch:cookies:${b.origin ?? b.replicas[0].endpointId}` }) : null;
@@ -74,7 +144,7 @@ export function makeCreate(init) {
         r.reset = () => (pending = null);
         // Dials once and shares the result; a failure is forgotten so a later request retries.
         r.ensureConnected = () =>
-          (pending ??= connectWithTimeout(client, r, connectTimeout).then(
+          (pending ??= dial(r).then(
             () => {
               retryDelay = 0;
             },
@@ -213,6 +283,8 @@ export function makeCreate(init) {
       exportSecretKey: () => client.secretKey(),
       /** Empties the HTTP cache (`cache` option), e.g. on logout. */
       clearCache: async () => httpCache?.clear(),
+      /** Calls relayToken() now; with a new token, replaces the client. True if it did. */
+      refreshRelayToken,
       close: () => {
         closed = true;
         for (const t of timers) clearTimeout(t);

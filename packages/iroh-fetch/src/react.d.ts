@@ -4,6 +4,11 @@ import type { InstallOptions, IrohFetch, IrohFetchOptions } from "./index";
 export interface IrohProviderProps extends Partial<IrohFetchOptions> {
   children?: ReactNode;
   /**
+   * See `IrohFetchOptions.relayToken`; best a function that asks your backend. It may be written
+   * inline: a new function on re-render doesn't reconnect, the latest one is called when needed.
+   */
+  relayToken?: string | (() => string | Promise<string>);
+  /**
    * Route the global fetch / WebSocket / EventSource through iroh while mounted, so existing
    * code and libraries (SWR, React Query, axios with the fetch adapter...) work unchanged.
    */

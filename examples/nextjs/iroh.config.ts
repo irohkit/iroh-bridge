@@ -32,10 +32,22 @@ export const backends: IrohFetchOptions["backends"] = process.env.NEXT_PUBLIC_IR
   : demoBackends;
 
 // Relay: n0's public relays unless you set your own (see deploy/relay/README.md). Set the same relay
-// the gateways use; NEXT_PUBLIC_IROH_RELAY_TOKEN only if that relay requires a token. A token here
-// ends up in the page, so it limits who uses the relay, not who reaches your data.
+// the gateways use.
 export const relayUrl = process.env.NEXT_PUBLIC_IROH_RELAY_URL || undefined;
-export const relayToken = process.env.NEXT_PUBLIC_IROH_RELAY_TOKEN || undefined;
+
+// If that relay requires a token, set IROH_RELAY_TOKEN (server-only): app/api/relay-token serves it
+// at runtime, so it isn't in the bundle and rotating it needs no redeploy. NEXT_PUBLIC_IROH_RELAY_TOKEN
+// is the older fallback; it ends up in the page source, where anyone can read it.
+const bundledRelayToken = process.env.NEXT_PUBLIC_IROH_RELAY_TOKEN || "";
+
+/** The relay token, asked from our own backend each time iroh-fetch needs one. */
+export async function relayToken(): Promise<string> {
+  try {
+    const res = await fetch("/api/relay-token", { cache: "no-store" });
+    if (res.ok) return await res.text();
+  } catch {}
+  return bundledRelayToken;
+}
 
 export const API = "https://api.demo";
 export const FILES = "https://files.demo";

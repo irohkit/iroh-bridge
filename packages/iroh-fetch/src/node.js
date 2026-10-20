@@ -7,7 +7,7 @@ if (typeof globalThis.WebSocket !== "function") {
   throw new Error("iroh-fetch needs a global WebSocket (Node.js >= 22)");
 }
 
-const BACKENDS = new Set(["auto", "native", "wasm"]);
+const ENGINES = new Set(["auto", "native", "wasm"]);
 
 let wasmReady;
 const wasm = () =>
@@ -16,13 +16,14 @@ const wasm = () =>
     .then(() => ({ IrohClient, enableLogging, native: false })));
 
 /**
- * Picks the client implementation: the native addon (direct UDP paths, hole punching) when a
- * prebuild for this platform is installed, else the WASM build (always via a relay).
- * `backend` (option) or IROH_FETCH_BACKEND (env) = "native" | "wasm" forces one; "auto" is the default.
+ * Picks the client implementation: the native addon (UDP, hole punching to direct paths) when a
+ * prebuild for this platform is installed, else the WASM build (always through a relay).
+ * `engine` (option), else IROH_FETCH_BACKEND (env): "native" or "wasm" forces one, "auto" (default)
+ * prefers native and falls back to WASM silently.
  */
-export async function selectBackend(backend) {
-  const wanted = String(backend ?? (process.env.IROH_FETCH_BACKEND || "auto")).toLowerCase();
-  if (!BACKENDS.has(wanted)) throw new Error(`iroh-fetch: unknown backend ${JSON.stringify(wanted)} (use "auto", "native" or "wasm")`);
+export async function selectEngine(engine) {
+  const wanted = String(engine ?? (process.env.IROH_FETCH_BACKEND || "auto")).toLowerCase();
+  if (!ENGINES.has(wanted)) throw new Error(`iroh-fetch: unknown engine ${JSON.stringify(wanted)} (use "auto", "native" or "wasm")`);
   if (wanted === "wasm") return wasm();
   try {
     return loadNative();
@@ -34,17 +35,16 @@ export async function selectBackend(backend) {
 
 /** @type {import("./index.d.ts").createIrohFetch} */
 export async function createIrohFetch(options) {
-  const chosen = await selectBackend(options?.backend);
+  const chosen = await selectEngine(options?.engine);
   let client;
   // Keep a handle on the client core.js creates, for connectionInfo().
-  class IrohClient {
+  class TrackedClient {
     static async create(...args) {
       return (client = await chosen.IrohClient.create(...args));
     }
   }
-  const iroh = await makeCreate(async () => ({ ...chosen, IrohClient }))(options);
-  iroh.backend = chosen.native ? "native" : "wasm";
-  /** How this client reaches a gateway right now: `{ kind: "direct" | "relay" | "none", paths }`, or null. */
+  const iroh = await makeCreate(async () => ({ ...chosen, IrohClient: TrackedClient }))(options);
+  iroh.engine = chosen.native ? "native" : "wasm";
   iroh.connectionInfo = (endpointId) => client.connectionInfo(endpointId ?? iroh.backends[0].replicas[0].endpointId) ?? null;
   return iroh;
 }

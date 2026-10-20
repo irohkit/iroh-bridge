@@ -25,5 +25,7 @@ const socket = new WebSocket("wss://files.example.com/ws");
 - Many backends from one frontend, and HA replicas with failover or round-robin
 - React: `import { IrohProvider, useIroh, useIrohFetch } from "iroh-fetch/react"`
 - CLI: `npx -p iroh-fetch iroh-proxy <endpoint id> --port 8080` exposes a gateway on localhost
+- Uses n0's public relays by default; for your own (faster, token-protected) relay pass `relayUrl` and `relayToken`
+  ([guide](https://github.com/irohkit/iroh-bridge/blob/main/deploy/relay/README.md))
 
 Full documentation, the gateway and a live demo: <https://github.com/irohkit/iroh-bridge>

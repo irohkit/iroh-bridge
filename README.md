@@ -41,7 +41,6 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
   - [What your backend sees](#what-your-backend-sees)
 - [Local port: `iroh-proxy`](#local-port-iroh-proxy)
 - [Run your own relay](#run-your-own-relay)
-  - [Only let authorized clients use your relay](#only-let-authorized-clients-use-your-relay)
 - [Production notes](#production-notes)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -279,7 +278,7 @@ connects in about a second).
 | `connectTimeout` | `15000` | ms to wait for a gateway before `TimeoutError` (`0` = forever) |
 | `cookies` | `true` | keep and send cookies |
 | `persistCookies` | `false` | `true` (localStorage) or a `Storage` |
-| `relayUrl` | n0 relays | your own relay (recommended) |
+| `relayUrl` | n0 public relays | your own relay ([guide](deploy/relay/README.md)) |
 | `relayToken` | | token for a relay that requires one |
 | `logLevel` | off | `"info"`, `"debug"`, ... iroh logs in the console |
 
@@ -312,7 +311,7 @@ needs outbound UDP/HTTPS, and no inbound port.
 | `IROH_ALLOW_CLIENTS` / `--allow-client` | everyone | allowed client endpoint ids |
 | `IROH_ALLOW_PATHS` / `--allow-path` | everything | allowed path prefixes |
 | `IROH_KEY_FILE` / `--key-file` | `iroh-gateway.key` | secret key (created on first run) |
-| `IROH_RELAY_URL` / `--relay-url` | n0 relays | your own relay |
+| `IROH_RELAY_URL` / `--relay-url` | n0 public relays | your own relay ([guide](deploy/relay/README.md)) |
 | `IROH_RELAY_TOKEN` / `--relay-token` | | token for a relay that requires one |
 | `MAX_BODY_BYTES` / `--max-body` | 32 MiB | request body limit |
 | `UPSTREAM_COOLDOWN_SECS` | `10` | how long an unreachable upstream is skipped |
@@ -400,81 +399,26 @@ Add exceptions with `--allow-host` and `--allow-origin`.
 
 ## Run your own relay
 
-Browsers can't send UDP, so every browser request goes through a relay. n0's public relays work out of the box, but your
-own relay close to your users is the biggest speed-up you can get, and it removes a shared dependency.
+**Default: n0's public relays.** If you set no relay anywhere, gateways, clients and `iroh-proxy` all use them, and
+everything works out of the box.
 
-Measured on the demo (Thailand, relay on a small VPS in Thailand), same gateways and backend:
+Browsers can't send UDP, so every browser request passes through a relay, and your own relay close to your users is the
+biggest speed-up you can get. On the demo it cut request latency from 69 ms to 14 ms and raised uploads from 1.3 to
+11.5 MB/s. It can also be limited to clients holding a token.
 
-| | n0 public relay | own relay |
-|---|---|---|
-| request latency (p50) | 69 ms | **14 ms** |
-| upload throughput | 1.3 MB/s | **11.5 MB/s** |
-| 20 MB upload | 18 s | **1.9 s** |
-
-Moving only the gateways to your relay already gives these numbers: clients reach a gateway through the gateway's relay,
-even if the client itself still uses the default relays. Set `relayUrl` on the client too, to depend on nothing else.
-
-**On a VPS** with a public IP and a DNS name (e.g. `relay.example.com`), open 80/tcp, 443/tcp and 7842/udp, then:
+**[Full guide: deploy/relay/README.md](deploy/relay/README.md)** covers installing on a fresh server
+(`sudo ./deploy/relay/install.sh relay.example.com you@example.com`) or next to an existing Caddy/nginx/Traefik,
+creating and rotating tokens, and troubleshooting. In short, once it runs:
 
 ```bash
-sudo ./deploy/relay/install.sh relay.example.com you@example.com
-```
-
-That installs `iroh-relay` (via `cargo install iroh-relay --features server` if needed), writes
-[`deploy/relay/iroh-relay.toml`](deploy/relay/iroh-relay.toml) to `/etc/iroh-relay/`, gets a Let's Encrypt certificate
-automatically, and runs it as a sandboxed systemd service ([`deploy/relay/iroh-relay.service`](deploy/relay/iroh-relay.service))
-with per-client rate limits.
-
-**Use it** on every gateway and in the frontend (both sides must use the same relay):
-
-```bash
-IROH_RELAY_URL=https://relay.example.com iroh-gateway
+IROH_RELAY_URL=https://relay.example.com IROH_RELAY_TOKEN=<token, if required> iroh-gateway
 ```
 
 ```ts
-createIrohFetch({ relayUrl: "https://relay.example.com", backends: { ... } });
-// React: <IrohProvider relayUrl="https://relay.example.com" ...>
-// Next.js example: NEXT_PUBLIC_IROH_RELAY_URL=https://relay.example.com
+createIrohFetch({ relayUrl: "https://relay.example.com", relayToken: "<token, if required>", backends: { ... } });
 ```
 
-For local development, `iroh-relay --dev` serves plain HTTP on port 3340 (`relayUrl: "http://127.0.0.1:3340"`).
-
-**Already running a reverse proxy on 80/443** (Caddy, nginx, Traefik)? Run the relay as a container next to it with
-[`deploy/relay/docker-compose.yml`](deploy/relay/docker-compose.yml) and
-[`iroh-relay-behind-proxy.toml`](deploy/relay/iroh-relay-behind-proxy.toml), and add a site that proxies to it:
-
-```
-relay.example.com {
-    reverse_proxy iroh-relay:3340
-}
-```
-
-The demo relay runs this way, sharing port 443 with other sites on the same server.
-
-### Only let authorized clients use your relay
-
-Relays only forward end-to-end encrypted packets; they can't read or change traffic. Locking one down keeps strangers
-from using your bandwidth. With `access.shared_token` the relay only admits clients that present a token:
-
-```toml
-[access]
-shared_token = ["<secret token for gateways>", "<token for the web app>"]
-```
-
-```bash
-IROH_RELAY_URL=https://relay.example.com IROH_RELAY_TOKEN=<secret token for gateways> iroh-gateway
-iroh-proxy <id> --relay-url https://relay.example.com --relay-token <token>
-```
-
-```ts
-createIrohFetch({ relayUrl: "https://relay.example.com", relayToken: "<token for the web app>", backends: { ... } });
-```
-
-Give each audience its own token so you can revoke one without touching the others (remove it and restart the relay).
-A wrong or missing token fails right away with `relay … refused this client: not authorized`. Keep in mind that a token
-in a public web page is visible to anyone who opens it, so it limits casual use of your relay, not access to your data:
-users are authenticated by your backend (sessions, JWT), and gateways can restrict clients with `IROH_ALLOW_CLIENTS`.
-Other `access` modes: `allowlist` / `denylist` of endpoint ids, or `http` to ask your own service about each endpoint id.
+Leave both unset to stay on the public relays.
 
 ## Production notes
 

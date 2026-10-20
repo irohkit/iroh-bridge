@@ -10,16 +10,26 @@ permissions:
   id-token: write # npm trusted publishing + provenance
 
 jobs:
-  publish:
+  check-version:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
       - name: Check tag matches package version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           version=$(node -p "require('./packages/iroh-fetch/package.json').version")
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != package version $version"; exit 1; }
+
+  # The native addon for each platform; published below as iroh-fetch-<platform> packages.
+  prebuilds:
+    needs: check-version
+    uses: ./.github/workflows/native-prebuilds.yml
+
+  publish:
+    needs: prebuilds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,6 +50,11 @@ jobs:
       - name: Build WASM
         run: ./scripts/build-wasm.sh
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: prebuilds
+
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -49,10 +64,32 @@ jobs:
       # Trusted publishing (OIDC) needs npm >= 11.5.1; no NPM_TOKEN secret is used.
       - run: npm install -g npm@latest
 
-      - name: Smoke-test the built package
-        working-directory: packages/iroh-fetch
-        run: npm test
+      - name: Lay out the prebuild packages
+        # Writes npm-native/<platform>/ and pins them in iroh-fetch's optionalDependencies.
+        run: node scripts/native-packages.mjs prebuilds npm-native
 
-      - name: Publish
+      - name: Smoke-test the built package (WASM and native)
+        working-directory: packages/iroh-fetch
+        run: |
+          mkdir -p native && cp ../../prebuilds/native-linux-x64-gnu/iroh-fetch.linux-x64-gnu.node native/
+          IROH_FETCH_BACKEND=wasm npm test
+          IROH_FETCH_BACKEND=native npm test
+          rm -rf native
+
+      # The platform packages go first, so iroh-fetch never points at versions that don't exist.
+      # Already published versions are skipped, so a failed run can simply be re-run.
+      - name: Publish the prebuild packages
+        run: |
+          for dir in npm-native/*/; do
+            name=$(node -p "require('./$dir/package.json').name")
+            version=$(node -p "require('./$dir/package.json').version")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published"
+            else
+              (cd "$dir" && npm publish --access public --provenance)
+            fi
+          done
+
+      - name: Publish iroh-fetch
         working-directory: packages/iroh-fetch
         run: npm publish --access public --provenance

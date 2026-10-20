@@ -41,6 +41,7 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
   - [What your backend sees](#what-your-backend-sees)
 - [Local port: `iroh-proxy`](#local-port-iroh-proxy)
 - [Run your own relay](#run-your-own-relay)
+  - [Only let authorized clients use your relay](#only-let-authorized-clients-use-your-relay)
 - [Production notes](#production-notes)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -278,7 +279,8 @@ connects in about a second).
 | `connectTimeout` | `15000` | ms to wait for a gateway before `TimeoutError` (`0` = forever) |
 | `cookies` | `true` | keep and send cookies |
 | `persistCookies` | `false` | `true` (localStorage) or a `Storage` |
-| `relayUrl` | n0 relays | your own relay; must match the gateways |
+| `relayUrl` | n0 relays | your own relay (recommended) |
+| `relayToken` | | token for a relay that requires one |
 | `logLevel` | off | `"info"`, `"debug"`, ... iroh logs in the console |
 
 The client object: `fetch`, `EventSource`, `WebSocket`, `websocket(url, { protocols, headers })`, `install(opts)`,
@@ -311,6 +313,7 @@ needs outbound UDP/HTTPS, and no inbound port.
 | `IROH_ALLOW_PATHS` / `--allow-path` | everything | allowed path prefixes |
 | `IROH_KEY_FILE` / `--key-file` | `iroh-gateway.key` | secret key (created on first run) |
 | `IROH_RELAY_URL` / `--relay-url` | n0 relays | your own relay |
+| `IROH_RELAY_TOKEN` / `--relay-token` | | token for a relay that requires one |
 | `MAX_BODY_BYTES` / `--max-body` | 32 MiB | request body limit |
 | `UPSTREAM_COOLDOWN_SECS` | `10` | how long an unreachable upstream is skipped |
 | `RUST_LOG` | `iroh_gateway=info` | log level |
@@ -400,9 +403,16 @@ Add exceptions with `--allow-host` and `--allow-origin`.
 Browsers can't send UDP, so every browser request goes through a relay. n0's public relays work out of the box, but your
 own relay close to your users is the biggest speed-up you can get, and it removes a shared dependency.
 
-Measured with the test suite: through n0's public relay a request took about 70 ms and a 20 MB upload 18 s; through a
-self-hosted relay (on the same machine, so a best case) about 5–10 ms and 1.2 s. On a VPS near your users, expect
-something in between, dominated by the round trip to the VPS.
+Measured on the demo (Thailand, relay on a small VPS in Thailand), same gateways and backend:
+
+| | n0 public relay | own relay |
+|---|---|---|
+| request latency (p50) | 69 ms | **14 ms** |
+| upload throughput | 1.3 MB/s | **11.5 MB/s** |
+| 20 MB upload | 18 s | **1.9 s** |
+
+Moving only the gateways to your relay already gives these numbers: clients reach a gateway through the gateway's relay,
+even if the client itself still uses the default relays. Set `relayUrl` on the client too, to depend on nothing else.
 
 **On a VPS** with a public IP and a DNS name (e.g. `relay.example.com`), open 80/tcp, 443/tcp and 7842/udp, then:
 
@@ -429,9 +439,42 @@ createIrohFetch({ relayUrl: "https://relay.example.com", backends: { ... } });
 
 For local development, `iroh-relay --dev` serves plain HTTP on port 3340 (`relayUrl: "http://127.0.0.1:3340"`).
 
-Relays only forward end-to-end encrypted packets; they can't read or change traffic. You can still restrict who may use
-yours with `access` in the config (an allow-list, a deny-list, a shared token, or an HTTP callback). Browsers get a new
-endpoint id each session, so for public web apps leave it open and rely on the rate limits.
+**Already running a reverse proxy on 80/443** (Caddy, nginx, Traefik)? Run the relay as a container next to it with
+[`deploy/relay/docker-compose.yml`](deploy/relay/docker-compose.yml) and
+[`iroh-relay-behind-proxy.toml`](deploy/relay/iroh-relay-behind-proxy.toml), and add a site that proxies to it:
+
+```
+relay.example.com {
+    reverse_proxy iroh-relay:3340
+}
+```
+
+The demo relay runs this way, sharing port 443 with other sites on the same server.
+
+### Only let authorized clients use your relay
+
+Relays only forward end-to-end encrypted packets; they can't read or change traffic. Locking one down keeps strangers
+from using your bandwidth. With `access.shared_token` the relay only admits clients that present a token:
+
+```toml
+[access]
+shared_token = ["<secret token for gateways>", "<token for the web app>"]
+```
+
+```bash
+IROH_RELAY_URL=https://relay.example.com IROH_RELAY_TOKEN=<secret token for gateways> iroh-gateway
+iroh-proxy <id> --relay-url https://relay.example.com --relay-token <token>
+```
+
+```ts
+createIrohFetch({ relayUrl: "https://relay.example.com", relayToken: "<token for the web app>", backends: { ... } });
+```
+
+Give each audience its own token so you can revoke one without touching the others (remove it and restart the relay).
+A wrong or missing token fails right away with `relay … refused this client: not authorized`. Keep in mind that a token
+in a public web page is visible to anyone who opens it, so it limits casual use of your relay, not access to your data:
+users are authenticated by your backend (sessions, JWT), and gateways can restrict clients with `IROH_ALLOW_CLIENTS`.
+Other `access` modes: `allowlist` / `denylist` of endpoint ids, or `http` to ask your own service about each endpoint id.
 
 ## Production notes
 

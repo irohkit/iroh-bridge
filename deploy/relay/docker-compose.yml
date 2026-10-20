@@ -1,0 +1,30 @@
+# iroh relay behind a reverse proxy you already run (Caddy, nginx, Traefik) on 80/443.
+# The relay isn't published on any host port; the proxy reaches it over a shared Docker network
+# and terminates TLS. Example Caddy site:
+#
+#   relay.example.com {
+#       reverse_proxy iroh-relay:3340
+#   }
+#
+# Point `networks` at the network your proxy container is on.
+services:
+  iroh-relay:
+    image: n0computer/iroh-relay:v1.3.0
+    container_name: iroh-relay
+    command: ["--config-path", "/iroh-relay.toml"]
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 256
+    environment:
+      RUST_LOG: iroh_relay=info
+    volumes:
+      - ./iroh-relay-behind-proxy.toml:/iroh-relay.toml:ro
+    networks: [proxy]
+networks:
+  proxy:
+    external: true
+    name: proxy   # e.g. the network of your Caddy container

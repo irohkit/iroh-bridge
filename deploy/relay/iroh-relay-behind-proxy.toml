@@ -1,0 +1,21 @@
+# iroh-relay config for running behind a reverse proxy that terminates TLS (see docker-compose.yml).
+enable_relay = true
+http_bind_addr = "0.0.0.0:3340"
+# QUIC address discovery needs the relay to hold its own TLS certificate; the proxy has it instead.
+enable_quic_addr_discovery = false
+enable_metrics = false
+
+# Only clients presenting one of these tokens may use the relay. Use one token per audience so
+# each can be revoked alone, e.g. a secret one for gateways and one for your web app (which is
+# visible in the page). Generate with: openssl rand -hex 24
+# Remove this table to let anyone use the relay.
+[access]
+shared_token = ["change-me-gateways", "change-me-web"]
+
+[limits]
+accept_conn_limit = 50.0
+accept_conn_burst = 200
+
+[limits.client.rx]
+bytes_per_second = 10485760  # 10 MiB/s per client
+max_burst_bytes = 20971520   # 20 MiB

@@ -30,6 +30,9 @@ const socket = new WebSocket("wss://files.example.com/ws");
 - Many backends from one frontend, and HA replicas with failover or round-robin
 - React: `import { IrohProvider, useIroh, useIrohFetch, IrohImage, useIrohObjectUrl } from "iroh-fetch/react"`
 - CLI: `npx -p iroh-fetch iroh-proxy <endpoint id> --port 8080` exposes a gateway on localhost
+- Node.js: a native addon (prebuilt for linux x64/arm64 glibc, linux x64 musl, macOS and Windows x64, installed as an
+  optional dependency) gives direct UDP connections via hole punching, with the relay as fallback; elsewhere the WASM
+  build is used. Force one with `engine: "native" | "wasm"` or `IROH_FETCH_BACKEND`
 - Uses n0's public relays by default; for your own (faster, token-protected) relay pass `relayUrl` and `relayToken`
   ([guide](https://github.com/irohkit/iroh-bridge/blob/main/deploy/relay/README.md))
 

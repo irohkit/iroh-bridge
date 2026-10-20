@@ -57,7 +57,8 @@ export class IrohEventSource extends EventTarget {
     if (this.#lastEventId) headers.set("last-event-id", this.#lastEventId);
     let res;
     try {
-      res = await this.#fetch(this.url, { headers, signal: this.#abort.signal });
+      // Like browsers, never from (or into) an HTTP cache.
+      res = await this.#fetch(this.url, { headers, cache: "no-store", signal: this.#abort.signal });
     } catch (err) {
       return this.#reconnect(err);
     }

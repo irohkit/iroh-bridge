@@ -1,4 +1,5 @@
 import { IrohClient, enableLogging } from "../wasm/web_client.js";
+import { createHttpCache } from "./cache.js";
 import { CookieJar } from "./cookies.js";
 import { IrohEventSource } from "./eventsource.js";
 import { IrohWebSocket } from "./websocket.js";
@@ -35,6 +36,7 @@ export function makeCreate(init) {
     } = options ?? {};
     const single = !options?.backends;
     const backends = parseBackends(options);
+    const httpCache = createHttpCache(options?.cache);
     await init();
     if (logLevel) enableLogging(logLevel);
     // One local endpoint serves every gateway; each gateway gets its own connection.
@@ -62,6 +64,7 @@ export function makeCreate(init) {
       // One jar per backend, shared by its replicas, so a session survives a failover.
       b.jar = cookies ? new CookieJar(storage && { storage, key: `iroh-fetch:cookies:${b.origin ?? b.replicas[0].endpointId}` }) : null;
       b.cooldown = cooldown;
+      b.cacheKey = b.origin ?? b.replicas[0].endpointId;
       for (const r of b.replicas) {
         let pending = null;
         let retryDelay = 0;
@@ -122,7 +125,7 @@ export function makeCreate(init) {
     };
 
     const api = (forced) => {
-      const irohFetch = (input, init) => fetchOverIroh(client, route, forced, input, init);
+      const irohFetch = (input, init) => fetchOverIroh(client, route, forced, input, init, httpCache);
       class WebSocket extends IrohWebSocket {
         constructor(url, protocols) {
           const target = toUrl(url);
@@ -206,6 +209,8 @@ export function makeCreate(init) {
       endpointId: client.endpointId(),
       /** This client's secret key (hex), to give it the same endpoint id next time. Keep it secret. */
       exportSecretKey: () => client.secretKey(),
+      /** Empties the HTTP cache (`cache` option), e.g. on logout. */
+      clearCache: async () => httpCache?.clear(),
       close: () => {
         closed = true;
         for (const t of timers) clearTimeout(t);
@@ -356,7 +361,7 @@ function cookieApi(jar) {
   return jar ?? { get: () => undefined, clear() {}, header: () => "" };
 }
 
-async function fetchOverIroh(client, route, forced, input, init) {
+async function fetchOverIroh(client, route, forced, input, init, cache) {
   // A ReadableStream body is uploaded as-is. Everything else goes through the platform's
   // Request, which normalises strings, FormData, Blob, URLSearchParams... into a stream and
   // fills in headers such as content-type.
@@ -369,6 +374,11 @@ async function fetchOverIroh(client, route, forced, input, init) {
   let url = new URL(req.url);
   const backend = route(url, forced);
   const jar = req.credentials !== "omit" ? backend.jar : null;
+  // With the cache option, GET / HEAD go through src/cache.js, which sends with the cache off.
+  if (cache && (req.method === "GET" || req.method === "HEAD")) {
+    const ctx = { backend: backend.cacheKey, cookie: jar?.header(url.pathname) ?? "" };
+    return cache.handle(req, ctx, (sent) => fetchOverIroh(client, route, forced, sent, undefined, null));
+  }
   let method = req.method;
   let headers = new Headers(req.headers);
   let body = streamBody ?? req.body ?? undefined;
@@ -445,6 +455,7 @@ async function fetchOverIroh(client, route, forced, input, init) {
     const response = new Response(stream, { status: res.status, headers: res.headers });
     Object.defineProperty(response, "url", { value: url.href });
     Object.defineProperty(response, "redirected", { value: redirected });
+    if (cache) await cache.invalidate(backend.cacheKey, req.url, response);
     return response;
   }
 }

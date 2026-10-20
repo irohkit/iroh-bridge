@@ -7,6 +7,8 @@ const port = Number(process.env.PORT ?? 8080);
 // Shown in responses so a frontend talking to several backends can tell them apart.
 const name = process.env.BACKEND_NAME ?? "A";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Per-id request counters for the /cache/* routes.
+const cacheState = new Map();
 
 // Minimal HS256 JWTs, to show token auth working over iroh exactly as over a public URL.
 const JWT_SECRET = process.env.JWT_SECRET ?? "demo-secret-change-me";
@@ -148,6 +150,60 @@ async function handle(req, res) {
   if (req.url?.startsWith("/download")) {
     res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-disposition": 'attachment; filename="report.txt"' });
     return res.end(`report from backend ${name}\n`);
+  }
+
+  // HTTP caching (iroh-fetch's `cache` option). /cache/resource?id=<any> answers with the caching
+  // headers asked for in the query and counts the requests it really got, which /cache/hits?id= reports:
+  //   max-age=N   Cache-Control: max-age=N        expires=N  Expires: N s from now
+  //   cc=<value>  any Cache-Control (e.g. no-store, no-cache, "public, max-age=60")
+  //   etag=1      ETag, answering If-None-Match with 304   lm=1  Last-Modified, answering If-Modified-Since
+  //   vary=<hdr>  Vary: <hdr>, and the body echoes that request header
+  // POST / PUT / DELETE /cache/resource?id= change the resource (a new ETag and Last-Modified).
+  if (req.url?.startsWith("/cache/")) {
+    const url = new URL(req.url, "http://x");
+    const id = url.searchParams.get("id") ?? "";
+    let state = cacheState.get(id);
+    if (!state) {
+      state = { hits: 0, notModified: 0, version: 1, modified: new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000) };
+      cacheState.set(id, state);
+      // Keep the demo's memory bounded however many ids the tests make up.
+      if (cacheState.size > 1000) cacheState.delete(cacheState.keys().next().value);
+    }
+    if (url.pathname === "/cache/hits") {
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      return res.end(JSON.stringify({ id, hits: state.hits, notModified: state.notModified, version: state.version }));
+    }
+    if (url.pathname !== "/cache/resource") return res.writeHead(404).end();
+    for await (const _ of req);
+    state.hits++;
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      state.version++;
+      state.modified = new Date(Math.floor(Date.now() / 1000) * 1000);
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ id, version: state.version }));
+    }
+    const q = url.searchParams;
+    const headers = { "content-type": "application/json" };
+    const cc = [q.get("cc"), q.has("max-age") && `max-age=${Number(q.get("max-age"))}`].filter(Boolean).join(", ");
+    if (cc) headers["cache-control"] = cc;
+    if (q.has("expires")) headers.expires = new Date(Date.now() + Number(q.get("expires")) * 1000).toUTCString();
+    const etag = `"${id}-v${state.version}"`;
+    if (q.has("etag")) headers.etag = etag;
+    if (q.has("lm")) headers["last-modified"] = state.modified.toUTCString();
+    const vary = q.get("vary")?.toLowerCase();
+    if (vary) headers.vary = vary;
+    const inm = req.headers["if-none-match"];
+    const ims = Date.parse(req.headers["if-modified-since"] ?? "");
+    const notModified = q.has("etag") && inm ? inm.split(",").some((t) => t.trim() === etag) : q.has("lm") && ims >= state.modified.getTime();
+    if (notModified) {
+      state.notModified++;
+      delete headers["content-type"];
+      return res.writeHead(304, headers).end();
+    }
+    res.writeHead(200, headers);
+    return res.end(
+      JSON.stringify({ backend: name, id, hit: state.hits, version: state.version, ...(vary && { [vary]: req.headers[vary] ?? null }) }),
+    );
   }
 
   // Answers after a delay, to try timeouts and aborts.

@@ -24,6 +24,7 @@ const socket = new WebSocket("wss://files.example.com/ws");
 - `XMLHttpRequest` too (axios's default browser adapter, jQuery, upload progress)
 - Optional service worker for `<img>`, `<video>`, CSS and downloads of backend URLs; where there is none (LINE and
   other iOS in-app browsers), `iroh.objectUrl(url)` or `<IrohImage>` load images over iroh into `blob:` URLs
+- Optional client HTTP cache (`cache: true`): Cache-Control, ETag / Last-Modified revalidation, Vary, `Request.cache`
 - Optional fixed client identity (`persistIdentity`, `secretKey`)
 - Standard `WebSocket` and `EventSource` (reconnect, `Last-Event-ID`), plus custom headers
 - Many backends from one frontend, and HA replicas with failover or round-robin

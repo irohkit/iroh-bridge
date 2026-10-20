@@ -58,6 +58,7 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
 | **Works like a public URL** | `install()` routes the global `fetch`, `XMLHttpRequest`, `EventSource` and `WebSocket` for chosen origins, so existing code, axios, SWR, React Query, jQuery and friends work unchanged |
 | **Images, video, downloads** | an optional service worker makes `<img>`, `<video>`, CSS `url()`, fonts and downloads of backend URLs work too |
 | **Full fetch semantics** | absolute or relative URLs, all methods and headers, `res.url` / `res.redirected`, redirects (`follow` / `manual` / `error`), cookies (`credentials`), `AbortSignal` (incl. `AbortSignal.timeout`) |
+| **Client cache** | opt-in HTTP cache (`cache: true`): `Cache-Control` / `Expires`, ETag and Last-Modified revalidation, `Vary`, `Request.cache` modes, in memory or the Cache API |
 | **Streaming both ways** | responses stream (SSE, NDJSON, downloads); uploads of `File`, `Blob`, `FormData` or `ReadableStream` stream without buffering |
 | **WebSocket** | standard API, text and binary, subprotocols, clean close codes, plus custom handshake headers (e.g. `Authorization`) |
 | **EventSource** | standard API with named events, automatic reconnect and `Last-Event-ID` |
@@ -300,6 +301,44 @@ On the backend side, one gateway can also spread load over several upstream proc
   `iroh.cookies.get(name)`, and use `iroh.cookies.clear()` to log out locally.
 - **Headers**: everything is passed through except hop-by-hop headers. Browsers can't read `Set-Cookie` from a
   `Response`, but the cookie jar can.
+- **Caching**: requests over iroh bypass the browser's HTTP cache, so by default every GET crosses the relay again.
+  Pass `cache: true` for a client-side HTTP cache (below).
+
+#### HTTP cache (`cache` option)
+
+```ts
+const iroh = await createIrohFetch({ backends: { ... }, cache: true });
+// or: cache: { maxEntries: 500, maxBytes: 50_000_000, storage: "memory" | "cache-api" }
+```
+
+With the option on, `GET` and `HEAD` responses are cached like a browser's private HTTP cache (for `iroh.fetch`, the
+installed global `fetch` and `XMLHttpRequest`; never EventSource). A fresh hit costs no network round trip at all; a
+stale entry with a validator costs one small request with an empty 304 body. With the option off nothing changes.
+
+- **Freshness**: `Cache-Control: max-age` (else `Expires`, else not fresh) minus the response's age. `s-maxage` is for
+  shared caches and ignored. There is no heuristic freshness: a response without `max-age` / `Expires` is only kept if
+  it has an `ETag` or `Last-Modified`, and then revalidated on every use.
+- **Directives**: `no-store` is never stored; `no-cache` is stored but always revalidated; `private` is fine (this is
+  a private cache); `public` allows caching credentialed requests (next point).
+- **Credentials**: requests carrying `Authorization` or cookies (their own `Cookie` header, or cookies from the jar)
+  are only stored, and only answered from the cache, when the response says `public`. Once the backend sets a session
+  cookie, use `credentials: "omit"` for public resources you want cached.
+- **Revalidation**: stale (or `no-cache`) entries are revalidated with `If-None-Match` / `If-Modified-Since`; a `304`
+  refreshes the stored headers and you get the cached body as a normal `200`. Requests where the app sets its own
+  conditional or `Range` headers are sent as-is.
+- **`Request.cache`**: `default`, `no-store` (bypass), `reload` (fetch and store), `no-cache` (always revalidate),
+  `force-cache` (use any entry, even stale) and `only-if-cached` (any entry, else a `TypeError`; the Fetch standard
+  requires `mode: "same-origin"` with it). Request `Cache-Control: no-cache` / `no-store` and `Pragma: no-cache` work too.
+- **Keys**: per backend and URL (including the query), one entry per `Vary` variant; `Vary: *` is not stored. Only
+  `200`, `203`, `204`, `404`, `405`, `410`, `414` and `501` responses are stored, and only once their body has been
+  read to the end. A successful `POST` / `PUT` / `PATCH` / `DELETE` drops the entries for its URL (and its
+  `Location` / `Content-Location`).
+- **Storage**: `"memory"` (default) is per page load; `"cache-api"` keeps entries in the browser's Cache API across
+  reloads (falls back to memory where there is none, such as Node or plain-http pages). The least recently used
+  entries are evicted beyond `maxEntries` (500) or `maxBytes` (50 MB). `iroh.clearCache()` empties it, e.g. on logout.
+
+The demo backend's `/cache/resource?id=…&max-age=60&etag=1` route sends these headers and `/cache/hits?id=…` counts
+what really reached it; [`test/cache-e2e.test.js`](packages/iroh-fetch/test/cache-e2e.test.js) uses them.
 
 ### Streaming, uploads, timeouts
 
@@ -376,6 +415,7 @@ connects in about a second).
 | `connectTimeout` | `15000` | ms to wait for a gateway before `TimeoutError` (`0` = forever) |
 | `cookies` | `true` | keep and send cookies |
 | `persistCookies` | `false` | `true` (localStorage) or a `Storage` |
+| `cache` | `false` | client HTTP cache: `true` or `{ maxEntries?: 500, maxBytes?: 50e6, storage?: "memory" \| "cache-api" }` ([details](#http-cache-cache-option)) |
 | `relayUrl` | n0 public relays | your own relay ([guide](deploy/relay/README.md)) |
 | `relayToken` | | token for a relay that requires one |
 | `secretKey` | random | fixed client identity (64 hex chars) |
@@ -384,7 +424,7 @@ connects in about a second).
 
 The client object: `fetch`, `XMLHttpRequest`, `EventSource`, `WebSocket`, `websocket(url, { protocols, headers })`,
 `install(opts)`, `serviceWorker(opts)`, `proxyUrl(url)`, `objectUrl(url, init)`, `backend(origin)`, `backends`, `cookies`, `endpointId` (this
-client's id, which the backend sees as `X-Iroh-Remote-Id`), `exportSecretKey()`, `close()`.
+client's id, which the backend sees as `X-Iroh-Remote-Id`), `exportSecretKey()`, `clearCache()`, `close()`.
 
 ## Backend: `iroh-gateway`
 

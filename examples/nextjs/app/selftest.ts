@@ -4,7 +4,12 @@ import { API, FILES } from "../iroh.config";
 
 import type { IrohFetch } from "iroh-fetch";
 
-export type Check = { name: string; run: (ctx: { endpointId: string; client: IrohFetch }) => Promise<string> };
+export type Check = {
+  name: string;
+  /** Checks that need the service worker are skipped where browsers don't offer one (iOS in-app browsers). */
+  needsServiceWorker?: boolean;
+  run: (ctx: { endpointId: string; client: IrohFetch }) => Promise<string>;
+};
 
 function assert(ok: unknown, message: string): asserts ok {
   if (!ok) throw new Error(message);
@@ -212,6 +217,7 @@ export const checks: Check[] = [
   },
   {
     name: "<img src> from a backend (service worker)",
+    needsServiceWorker: true,
     run: () =>
       new Promise((resolve, reject) => {
         const img = new Image();
@@ -222,6 +228,7 @@ export const checks: Check[] = [
   },
   {
     name: "Download link via proxyUrl (service worker)",
+    needsServiceWorker: true,
     run: async ({ client }) => {
       const url = client.proxyUrl(`${API}/download`);
       // A plain same-origin request, as a browser download or new tab would make.

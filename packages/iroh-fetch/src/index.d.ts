@@ -126,6 +126,8 @@ export interface IrohFetch {
    */
   serviceWorker(options?: { url?: string; scope?: string; hosts?: string[] }): Promise<{
     registration: ServiceWorkerRegistration;
+    /** False if the worker didn't take control within 5 s (it may still later). */
+    controlled: boolean;
     unregister(): Promise<void>;
   }>;
   /**

@@ -47,7 +47,7 @@ function Status() {
   );
 }
 
-type Result = { name: string; ok: boolean; detail: string; ms: number };
+type Result = { name: string; ok: boolean; skipped?: boolean; detail: string; ms: number };
 
 function SelfTest({ disabled }: { disabled: boolean }) {
   const iroh = useIroh();
@@ -61,6 +61,10 @@ function SelfTest({ disabled }: { disabled: boolean }) {
     for (const check of checks) {
       const started = performance.now();
       let result: Result;
+      if (check.needsServiceWorker && !navigator.serviceWorker?.controller) {
+        setResults((prev) => [...prev, { name: check.name, ok: true, skipped: true, detail: "no service worker in this browser", ms: 0 }]);
+        continue;
+      }
       try {
         const detail = await check.run({ endpointId: iroh.client.endpointId, client: iroh.client });
         result = { name: check.name, ok: true, detail, ms: performance.now() - started };
@@ -72,7 +76,8 @@ function SelfTest({ disabled }: { disabled: boolean }) {
     setRunning(false);
   }
 
-  const passed = results.filter((r) => r.ok).length;
+  const skipped = results.filter((r) => r.skipped).length;
+  const passed = results.filter((r) => r.ok && !r.skipped).length;
   return (
     <section>
       <h2>Self-test</h2>
@@ -81,13 +86,13 @@ function SelfTest({ disabled }: { disabled: boolean }) {
       </button>
       {results.length > 0 && (
         <p data-testid="selftest-summary">
-          {passed}/{checks.length} passed{running ? " so far" : ""}
+          {passed}/{checks.length - skipped} passed{skipped ? ` (${skipped} skipped)` : ""}{running ? " so far" : ""}
         </p>
       )}
       <ul data-testid="selftest-results" style={{ listStyle: "none", padding: 0 }}>
         {results.map((r) => (
           <li key={r.name}>
-            {r.ok ? "✅" : "❌"} {r.name} <small>({Math.round(r.ms)} ms) {r.detail}</small>
+            {r.skipped ? "⏭️" : r.ok ? "✅" : "❌"} {r.name} <small>({Math.round(r.ms)} ms) {r.detail}</small>
           </li>
         ))}
       </ul>

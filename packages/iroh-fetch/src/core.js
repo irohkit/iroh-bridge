@@ -500,11 +500,20 @@ async function registerServiceWorker(irohFetch, hosts, { url = "/iroh-sw.js", sc
   sw.addEventListener("message", onMessage);
   sw.startMessages?.();
   const registration = await sw.register(`${url}?hosts=${encodeURIComponent(hosts.join(","))}`, scope ? { scope } : undefined);
-  await sw.ready;
-  // The worker claims open pages when it activates; wait for that so the first images already work.
-  if (!sw.controller) await new Promise((resolve) => sw.addEventListener("controllerchange", resolve, { once: true }));
+  // The worker claims open pages when it activates; wait for that so the first images already work,
+  // but never hang the app on it (some in-app browsers register workers that never take control).
+  const controlled = await withTimeout(
+    (async () => {
+      await sw.ready;
+      if (!sw.controller) await new Promise((resolve) => sw.addEventListener("controllerchange", resolve, { once: true }));
+      return true;
+    })(),
+    5000,
+    () => new Error("service worker did not take control"),
+  ).catch(() => false);
   return {
     registration,
+    controlled,
     async unregister() {
       sw.removeEventListener("message", onMessage);
       await registration.unregister();

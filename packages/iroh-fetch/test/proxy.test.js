@@ -11,6 +11,7 @@ const endpointId = process.env.IROH_ENDPOINT_ID;
 const opts = { skip: !endpointId, timeout: 60_000 };
 let child;
 let base;
+let stopping = false;
 
 before(async () => {
   if (!endpointId) return;
@@ -29,9 +30,14 @@ before(async () => {
     });
     child.once("exit", (code) => reject(new Error(`iroh-proxy exited with ${code}: ${stderr}`)));
   });
+  // If it dies mid-run, every later test fails with ECONNREFUSED; say why once.
+  child.once("exit", (code, signal) => {
+    if (!stopping) console.error(`iroh-proxy exited early (${code ?? signal}): ${stderr}`);
+  });
 });
 after(async () => {
   if (!child || child.exitCode !== null) return;
+  stopping = true;
   child.kill("SIGTERM");
   await once(child, "exit");
 });

@@ -37,7 +37,16 @@ export function IrohProvider({ children, install, serviceWorker, ...options }) {
         if (cancelled) return c.close();
         if (install) uninstall = c.install(install === true ? undefined : install);
         // Report ready only once the worker controls the page, so the first <img> already loads.
-        if (serviceWorker) await c.serviceWorker(serviceWorker === true ? undefined : serviceWorker);
+        // Where service workers aren't available (iOS in-app browsers such as LINE or Facebook,
+        // some private modes), carry on without them: everything but browser-initiated loads
+        // (<img>, <video>, CSS) still works.
+        if (serviceWorker) {
+          try {
+            await c.serviceWorker(serviceWorker === true ? undefined : serviceWorker);
+          } catch (err) {
+            console.warn("iroh-fetch: service worker unavailable, <img>/<video> of backend URLs won't load:", err?.message ?? err);
+          }
+        }
         if (cancelled) return;
         setState({ status: "ready", client: c, error: null });
         ready.resolve(c);

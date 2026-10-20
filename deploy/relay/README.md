@@ -132,7 +132,7 @@ one for the web app:
 
 ```bash
 echo "gw_$(openssl rand -hex 24)"    # gateways, iroh-proxy, server-side Node: keep secret
-echo "web_$(openssl rand -hex 16)"   # browser apps: visible in the page source
+echo "web_$(openssl rand -hex 16)"   # browser apps: served by your backend to logged-in users
 ```
 
 **Configure the relay:** in `/etc/iroh-relay/iroh-relay.toml` (section 2) or `iroh-relay-behind-proxy.toml` (section 3),
@@ -161,12 +161,33 @@ echo 'IROH_RELAY_TOKEN=gw_...' | sudo tee /etc/iroh-gateway.env >/dev/null && su
 # in the unit:  EnvironmentFile=/etc/iroh-gateway.env
 ```
 
+**Web apps: serve the token from your backend.** A token string in the bundle can be read by anyone and needs a redeploy
+to rotate. Keep it in a server-only env var instead and hand it to logged-in users at runtime; `relayToken` takes a
+function for that. In Next.js:
+
 ```ts
-// browser / Node client
-createIrohFetch({ relayUrl: "https://relay.example.com", relayToken: "web_...", backends: { ... } });
-// React: <IrohProvider relayUrl="..." relayToken="..." ...>
-// Next.js example: NEXT_PUBLIC_IROH_RELAY_URL + NEXT_PUBLIC_IROH_RELAY_TOKEN
+// app/api/relay-token/route.ts  (env: IROH_RELAY_TOKEN=web_..., no NEXT_PUBLIC_ prefix)
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  if (!(await getSession())) return new Response(null, { status: 401 }); // your auth
+  return new Response(process.env.IROH_RELAY_TOKEN, { headers: { "cache-control": "no-store" } });
+}
 ```
+
+```tsx
+// client
+const getRelayToken = () => fetch("/api/relay-token").then((r) => (r.ok ? r.text() : Promise.reject(new Error(`relay token: ${r.status}`))));
+
+<IrohProvider relayUrl="https://relay.example.com" relayToken={getRelayToken} backends={...}>
+// or: createIrohFetch({ relayUrl: "https://relay.example.com", relayToken: getRelayToken, backends: { ... } })
+```
+
+iroh-fetch calls the function before connecting and again whenever the relay refuses the client, so after a rotation
+clients pick up the new token by themselves (`relayTokenRefreshMs` or `iroh.refreshRelayToken()` fetch it earlier).
+Server-side Node clients can pass the `gw_...` token as a plain string. The Next.js example
+([`examples/nextjs`](../../examples/nextjs)) serves `IROH_RELAY_TOKEN` this way and falls back to the older, bundled
+`NEXT_PUBLIC_IROH_RELAY_TOKEN` when it's unset.
 
 ```bash
 # iroh-proxy
@@ -175,13 +196,14 @@ iroh-proxy <endpoint id> --relay-url https://relay.example.com --relay-token gw_
 ```
 
 **Rotate or revoke:** add the new token to `shared_token`, restart the relay, switch the clients over, then remove the
-old token and restart again. Removing a token cuts off everyone using it.
+old token and restart again. Removing a token cuts off everyone using it. Web apps that get the token from your backend
+switch over by changing the server's env var: when the relay refuses a client, it asks your backend again and
+reconnects with the new token (keeping its endpoint id; open WebSockets and streams reconnect).
 
-**What a token does and doesn't protect.** A token embedded in a public web page can be read by anyone who opens the
-page, so it only stops casual use of your relay. It does not decide who may reach your data. Do that in the backend
-(sessions, JWT; the gateway forwards `Authorization` and cookies), and, for server-to-server setups, with the gateway's
-`IROH_ALLOW_CLIENTS` allow-list. For a private web app, serve the token only to logged-in users (e.g. from your own
-login endpoint) rather than baking it into the bundle.
+**What a token does and doesn't protect.** Whoever gets the token can use your relay: with a bundled token that is
+anyone who opens the page, with a served one any logged-in user, who could copy it out. So it decides who may use your
+relay's bandwidth, not who may reach your data. Do that in the backend (sessions, JWT; the gateway forwards
+`Authorization` and cookies), and, for server-to-server setups, with the gateway's `IROH_ALLOW_CLIENTS` allow-list.
 
 Other access modes in the relay config: `access.allowlist = ["<endpoint id>", ...]` (fixed clients only),
 `access.denylist = [...]`, or `access.http = { url = "https://auth.example.com/relay" }` to ask your own service about

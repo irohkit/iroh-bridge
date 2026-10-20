@@ -444,7 +444,8 @@ expect the network's RTT instead of the relay detour, not these absolute numbers
 | `persistCookies` | `false` | `true` (localStorage) or a `Storage` |
 | `cache` | `false` | client HTTP cache: `true` or `{ maxEntries?: 500, maxBytes?: 50e6, storage?: "memory" \| "cache-api" }` ([details](#http-cache-cache-option)) |
 | `relayUrl` | n0 public relays | your own relay ([guide](deploy/relay/README.md)) |
-| `relayToken` | | token for a relay that requires one |
+| `relayToken` | | token for a relay that requires one: a string, or a function returning one (sync or async), best served by your backend ([details](#relay-token-from-your-backend)) |
+| `relayTokenRefreshMs` | `0` | with a `relayToken` function, also call it every this many ms (default: only when the relay refuses the client) |
 | `secretKey` | random | fixed client identity (64 hex chars) |
 | `persistIdentity` | `false` | keep the identity in localStorage (`true`) or a `Storage` |
 | `logLevel` | off | `"info"`, `"debug"`, ... iroh logs in the console |
@@ -452,7 +453,7 @@ expect the network's RTT instead of the relay detour, not these absolute numbers
 
 The client object: `fetch`, `XMLHttpRequest`, `EventSource`, `WebSocket`, `websocket(url, { protocols, headers })`,
 `install(opts)`, `serviceWorker(opts)`, `proxyUrl(url)`, `objectUrl(url, init)`, `backend(origin)`, `backends`, `cookies`, `endpointId` (this
-client's id, which the backend sees as `X-Iroh-Remote-Id`), `exportSecretKey()`, `clearCache()`, `close()`, and in
+client's id, which the backend sees as `X-Iroh-Remote-Id`), `exportSecretKey()`, `clearCache()`, `refreshRelayToken()`, `close()`, and in
 Node.js `engine` and `connectionInfo(endpointId?)`.
 
 ## Backend: `iroh-gateway`
@@ -624,10 +625,44 @@ IROH_RELAY_URL=https://relay.example.com IROH_RELAY_TOKEN=<token, if required> i
 ```
 
 ```ts
-createIrohFetch({ relayUrl: "https://relay.example.com", relayToken: "<token, if required>", backends: { ... } });
+createIrohFetch({ relayUrl: "https://relay.example.com", relayToken: getRelayToken, backends: { ... } });
 ```
 
 Leave both unset to stay on the public relays.
+
+### Relay token from your backend
+
+A token string in a web app is part of the bundle: anyone can read it, and rotating it needs a redeploy. Instead, give
+`relayToken` a function that asks your own backend, which hands the token only to logged-in users. In Next.js:
+
+```ts
+// app/api/relay-token/route.ts (IROH_RELAY_TOKEN is a server-only env var, no NEXT_PUBLIC_)
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  if (!(await getSession())) return new Response(null, { status: 401 }); // your auth
+  return new Response(process.env.IROH_RELAY_TOKEN, { headers: { "cache-control": "no-store" } });
+}
+```
+
+```tsx
+const getRelayToken = async () => {
+  const res = await fetch("/api/relay-token");
+  if (!res.ok) throw new Error(`relay token: ${res.status}`);
+  return res.text();
+};
+
+<IrohProvider relayUrl="https://relay.example.com" relayToken={getRelayToken} backends={...}>
+```
+
+iroh-fetch calls the function before it creates its client, and again whenever the relay refuses the client (e.g. after
+you rotated the token), then dials once more. Call `iroh.refreshRelayToken()` yourself (e.g. after login), or set
+`relayTokenRefreshMs`, to pick up a new token earlier. A token that differs from the current one replaces iroh-fetch's
+underlying client: the endpoint id stays the same (the secret key is carried over, with or without `secretKey` /
+`persistIdentity`), and so do cookies and the HTTP cache, but open WebSockets, streams and requests in flight on the old
+client are cut, and gateways are dialed again on the next request. The same token again changes nothing. If the function
+throws, `createIrohFetch` (or the refresh) fails with that error. [`examples/nextjs`](examples/nextjs) does this, falling
+back to `NEXT_PUBLIC_IROH_RELAY_TOKEN` when the server has no `IROH_RELAY_TOKEN`.
 
 ## Tested
 

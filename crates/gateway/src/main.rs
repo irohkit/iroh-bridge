@@ -17,7 +17,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use iroh::{
-    Endpoint, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher as _,
+    Endpoint, EndpointId, RelayMode, SecretKey, Watcher as _,
     endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, VarInt, presets},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -78,9 +78,10 @@ struct Args {
     /// File holding the endpoint's secret key. Created on first run so the endpoint id stays stable.
     #[arg(long, env = "IROH_KEY_FILE", default_value = "iroh-gateway.key")]
     key_file: PathBuf,
-    /// Use your own relay server instead of the public n0 relays (recommended for production).
+    /// Your own relay(s) instead of n0's public relays, comma-separated. Add `n0` to fall back to the
+    /// public relays when yours is down, e.g. `https://relay.example.com,n0`.
     #[arg(long, env = "IROH_RELAY_URL")]
-    relay_url: Option<RelayUrl>,
+    relay_url: Option<String>,
     /// Token for a relay that only admits clients with a token (iroh-relay `access.shared_token`).
     #[arg(long, env = "IROH_RELAY_TOKEN", hide_env_values = true, requires = "relay_url")]
     relay_token: Option<String>,
@@ -184,12 +185,8 @@ async fn main() -> Result<()> {
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
         .transport_config(transport);
-    if let Some(url) = args.relay_url.clone() {
-        let mut relay = iroh::RelayConfig::from(url);
-        if let Some(token) = args.relay_token.clone() {
-            relay = relay.with_auth_token(token);
-        }
-        builder = builder.relay_mode(RelayMode::Custom(relay.into()));
+    if let Some(spec) = args.relay_url.as_deref() {
+        builder = builder.relay_mode(RelayMode::Custom(proto::relay_map(spec, args.relay_token.as_deref())?));
     }
     let endpoint = builder.bind().await?;
 
@@ -1406,7 +1403,7 @@ struct Admin {
     ctx: Arc<Ctx>,
     endpoint: Endpoint,
     /// The relay configured with `--relay-url`, if any.
-    relay_url: Option<RelayUrl>,
+    relay_url: Option<String>,
     started: Instant,
 }
 

@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use iroh::{
-    Endpoint, EndpointId, RelayMode, RelayUrl,
+    Endpoint, EndpointId, RelayMode,
     endpoint::{Connection, RecvStream, SendStream, presets},
 };
 use js_sys::{Object, Promise, Reflect, Uint8Array};
@@ -36,6 +36,10 @@ pub fn enable_logging(level: &str) {
 
 struct Inner {
     endpoint: Endpoint,
+    /// The relays this client was configured with. Dialing a gateway "via" them lets the
+    /// connection start right away instead of waiting for an address lookup (which also keeps
+    /// running, so a gateway on another relay is still found).
+    relay_hints: Vec<iroh::RelayUrl>,
     /// One connection per gateway, all sharing this endpoint (and its relay connection).
     conns: std::cell::RefCell<std::collections::HashMap<EndpointId, Rc<Mutex<Option<Connection>>>>>,
 }
@@ -56,21 +60,23 @@ impl IrohClient {
         relay_token: Option<String>,
         secret_key: Option<String>,
     ) -> Result<IrohClient, JsError> {
-        let mut builder = Endpoint::builder(presets::N0);
+        // Like the N0 preset, but clients only look addresses up: nobody dials a client, so
+        // publishing its address would just cost every page load a DNS round trip.
+        let mut builder = Endpoint::builder(presets::Minimal)
+            .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns())
+            .relay_mode(RelayMode::Default);
+        let mut relay_hints = Vec::new();
         if let Some(hex) = secret_key.filter(|k| !k.is_empty()) {
             builder = builder.secret_key(parse_secret_key(&hex).map_err(js)?);
         }
-        if let Some(url) = relay_url.filter(|u| !u.is_empty()) {
-            let url: RelayUrl = url.parse().context("invalid relay url").map_err(js)?;
-            let mut relay = iroh::RelayConfig::from(url);
-            // In the browser this travels as `?token=` on the relay WebSocket URL.
-            if let Some(token) = relay_token.filter(|t| !t.is_empty()) {
-                relay = relay.with_auth_token(token);
-            }
-            builder = builder.relay_mode(RelayMode::Custom(relay.into()));
+        if let Some(spec) = relay_url.filter(|u| !u.is_empty()) {
+            // In the browser the token travels as `?token=` on the relay WebSocket URL.
+            let map = proto::relay_map(&spec, relay_token.as_deref()).map_err(js)?;
+            relay_hints = proto::listed_relays(&spec);
+            builder = builder.relay_mode(RelayMode::Custom(map));
         }
         let endpoint = builder.bind().await.map_err(js)?;
-        Ok(IrohClient(Rc::new(Inner { endpoint, conns: Default::default() })))
+        Ok(IrohClient(Rc::new(Inner { endpoint, relay_hints, conns: Default::default() })))
     }
 
     /// Why the home relay can't be used, if it can't: e.g. it refused the relay token. `None`
@@ -175,7 +181,11 @@ impl Inner {
                 return Ok(conn.clone());
             }
         }
-        let conn = self.endpoint.connect(remote, ALPN).await.context("connecting to gateway")?;
+        let addr = self
+            .relay_hints
+            .iter()
+            .fold(iroh::EndpointAddr::new(remote), |addr, url| addr.with_relay_url(url.clone()));
+        let conn = self.endpoint.connect(addr, ALPN).await.context("connecting to gateway")?;
         *guard = Some(conn.clone());
         Ok(conn)
     }

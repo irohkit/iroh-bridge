@@ -206,14 +206,16 @@ function parseBackends(options) {
         host: url.host,
         replicas: replicasOf(cfg, `backend ${origin}`),
         strategy: strategyOf(cfg),
-        next: 0,
+        // Start each client at a random replica, so round-robin also spreads first and long-lived
+        // connections (WebSockets) across many clients instead of piling them onto the first one.
+        next: Math.floor(Math.random() * 1024),
         default: Boolean(cfg && typeof cfg === "object" && !Array.isArray(cfg) && cfg.default),
       };
     });
   }
   const ids = options?.endpointIds ?? options?.endpointId;
   if (!ids || (Array.isArray(ids) && !ids.length)) throw new Error("iroh-fetch: endpointId (or backends) is required");
-  return [{ origin: null, host: null, replicas: replicasOf(ids, "endpointId"), strategy: options.strategy ?? "failover", next: 0, default: true }];
+  return [{ origin: null, host: null, replicas: replicasOf(ids, "endpointId"), strategy: options.strategy ?? "failover", next: Math.floor(Math.random() * 1024), default: true }];
 }
 
 /**

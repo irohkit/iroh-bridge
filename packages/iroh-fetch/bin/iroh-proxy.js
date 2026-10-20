@@ -27,7 +27,7 @@ Options:
                           ("*" = any). By default only pages served from the proxy itself
                           or from localhost may, so other sites can't use your gateway
                           access (cross-site requests and WebSockets).
-  --relay-url <url>       Your own relay (the gateway should use the same one)
+  --relay-url <urls>      Your own relay(s), comma-separated; add "n0" for a public fallback
   --relay-token <token>   Token for a relay that requires one (or env IROH_RELAY_TOKEN)
   --connect-timeout <ms>  How long to wait for the gateway (default 15000, 0 = forever)
   -h, --help              Show this help

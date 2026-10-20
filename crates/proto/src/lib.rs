@@ -181,3 +181,51 @@ mod tests {
         assert_eq!(serde_json::to_string(&head).unwrap(), r#"{"method":"GET","path":"/","headers":[["a","b"]]}"#);
     }
 }
+
+/// Builds a relay map from a comma-separated list of relay URLs. The entry `n0` (or `public`) adds
+/// n0's public relays, e.g. `https://relay.example.com,n0` uses your relay with the public ones as a
+/// fallback when it is down. The token goes only to the URLs you listed, never to n0's relays.
+pub fn relay_map(spec: &str, token: Option<&str>) -> Result<iroh::RelayMap> {
+    let map = iroh::RelayMap::empty();
+    for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if entry.eq_ignore_ascii_case("n0") || entry.eq_ignore_ascii_case("public") {
+            map.extend(&iroh::RelayMode::Default.relay_map());
+            continue;
+        }
+        let url: iroh::RelayUrl = entry.parse().with_context(|| format!("invalid relay url {entry:?}"))?;
+        let mut relay = iroh::RelayConfig::from(url.clone());
+        if let Some(token) = token.filter(|t| !t.is_empty()) {
+            relay = relay.with_auth_token(token);
+        }
+        map.insert(url, std::sync::Arc::new(relay));
+    }
+    ensure!(!map.is_empty(), "no relay given");
+    Ok(map)
+}
+
+/// The relay URLs explicitly listed in a relay spec (everything but `n0` / `public`).
+pub fn listed_relays(spec: &str) -> Vec<iroh::RelayUrl> {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty() && !e.eq_ignore_ascii_case("n0") && !e.eq_ignore_ascii_case("public"))
+        .filter_map(|e| e.parse().ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod relay_tests {
+    #[test]
+    fn relay_lists_and_public_fallback() {
+        let own = super::relay_map("https://relay.example.com", Some("t")).unwrap();
+        assert_eq!(own.len(), 1);
+        let both = super::relay_map("https://relay.example.com, n0", Some("t")).unwrap();
+        assert!(both.len() > 1);
+        // The token is only attached to the relay we listed, never to the public ones.
+        for relay in both.relays::<Vec<_>>() {
+            let ours = relay.url.as_str().contains("relay.example.com");
+            assert_eq!(relay.auth_token.is_some(), ours, "{}", relay.url);
+        }
+        assert!(super::relay_map(" , ", None).is_err());
+        assert!(super::relay_map("not a url", None).is_err());
+    }
+}

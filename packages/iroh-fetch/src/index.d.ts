@@ -37,8 +37,12 @@ export interface IrohFetchOptions {
    * Requests are routed by URL host; all gateways share one local endpoint.
    */
   backends?: Record<string, string | string[] | BackendConfig>;
-  /** Your own relay (recommended for production); gateways should use the same one. */
-  relayUrl?: string;
+  /**
+   * Your own relay (recommended for production), or several: `["https://relay.example.com", "n0"]`
+   * uses yours and falls back to n0's public relays if it's down ("n0" never gets your token).
+   * Default: n0's public relays.
+   */
+  relayUrl?: string | string[];
   /**
    * Token for a relay that only admits clients with a token (iroh-relay `access.shared_token`).
    * In a public web page the token is visible to anyone, so it limits who uses your relay's

@@ -19,6 +19,16 @@ export interface IrohFetchOptions {
   endpointIds?: string[];
   /** How replicas are picked when `endpointIds` has several (default "failover"). */
   strategy?: "failover" | "round-robin";
+  /**
+   * A fixed identity (64 hex chars, e.g. from exportSecretKey()), so gateways can allow-list or
+   * rate-limit this client by endpoint id. Mainly for servers and CLIs; keep it secret.
+   */
+  secretKey?: string;
+  /**
+   * Keep the same endpoint id across page loads: `true` stores the secret key in localStorage, or pass
+   * any Storage. Off by default: page scripts can read it, so an XSS bug could impersonate the device.
+   */
+  persistIdentity?: boolean | Storage;
   /** How long an unreachable replica is skipped before it is tried again, in ms (default 10000). */
   failoverCooldown?: number;
   /**
@@ -75,6 +85,8 @@ export interface InstallOptions {
   websocket?: boolean;
   /** Also route matching `new EventSource(url)` (default true). */
   eventSource?: boolean;
+  /** Also route matching `XMLHttpRequest` (axios's browser default, jQuery...) (default true). */
+  xhr?: boolean;
 }
 
 export interface IrohCookies {
@@ -101,13 +113,17 @@ export interface IrohFetch {
    * Extension: `headers` in the init dict.
    */
   EventSource: { new (url: string | URL, init?: EventSourceInit & { headers?: HeadersInit }): EventSource };
+  /** `new iroh.XMLHttpRequest()`: the standard XHR (incl. upload/download progress), over iroh. */
+  XMLHttpRequest: { new (): XMLHttpRequest };
+  /** This client's secret key (hex): pass it as `secretKey` later to keep the same endpoint id. */
+  exportSecretKey(): string;
   /**
-   * Route the global fetch (and WebSocket / EventSource) for matching URLs through iroh, so existing
+   * Route the global fetch (and WebSocket / EventSource / XMLHttpRequest) for matching URLs through iroh, so existing
    * code and libraries work unchanged. Returns a function that undoes it.
    */
   install(options: InstallOptions): () => void;
   /** A view scoped to one backend (path-only URLs go there), e.g. `iroh.backend("https://files.example.com")`. */
-  backend(origin: string): Pick<IrohFetch, "fetch" | "websocket" | "WebSocket" | "EventSource" | "cookies"> & { endpointIds: string[] };
+  backend(origin: string): Pick<IrohFetch, "fetch" | "websocket" | "WebSocket" | "EventSource" | "XMLHttpRequest" | "cookies"> & { endpointIds: string[] };
   /** The configured backends, their replicas and whether each is currently healthy. */
   backends: ReadonlyArray<{
     origin: string | null;

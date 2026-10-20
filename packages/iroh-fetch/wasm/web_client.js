@@ -157,16 +157,22 @@ export class IrohClient {
      * Create a local endpoint that can talk to any number of gateways.
      * `relay_url` must match the gateways' relay if they use a custom one; `relay_token` is
      * for relays that only admit clients with a token.
+     *
+     * `secret_key` (64 hex chars) gives the client a fixed endpoint id; without it a new one is
+     * generated, which `secretKey()` returns so it can be kept.
      * @param {string | null} [relay_url]
      * @param {string | null} [relay_token]
+     * @param {string | null} [secret_key]
      * @returns {Promise<IrohClient>}
      */
-    static create(relay_url, relay_token) {
+    static create(relay_url, relay_token, secret_key) {
         var ptr0 = isLikeNone(relay_url) ? 0 : passStringToWasm0(relay_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         var len0 = WASM_VECTOR_LEN;
         var ptr1 = isLikeNone(relay_token) ? 0 : passStringToWasm0(relay_token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         var len1 = WASM_VECTOR_LEN;
-        const ret = wasm.irohclient_create(ptr0, len0, ptr1, len1);
+        var ptr2 = isLikeNone(secret_key) ? 0 : passStringToWasm0(secret_key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len2 = WASM_VECTOR_LEN;
+        const ret = wasm.irohclient_create(ptr0, len0, ptr1, len1, ptr2, len2);
         return ret;
     }
     /**
@@ -220,6 +226,23 @@ export class IrohClient {
         const len2 = WASM_VECTOR_LEN;
         const ret = wasm.irohclient_request(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, headers, body);
         return ret;
+    }
+    /**
+     * This client's secret key as hex, to keep its endpoint id across sessions. Treat it like a
+     * password: whoever has it can act as this client.
+     * @returns {string}
+     */
+    secretKey() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.irohclient_secretKey(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
     }
     /**
      * Open a WebSocket to `path` on the backend. Resolves to `{ status, headers, socket }` where
@@ -949,27 +972,27 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 355, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 356, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true_);
             return ret;
         },
         __wbindgen_generic_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 431, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 432, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_e1363021040f656a___JsError___true_);
             return ret;
         },
         __wbindgen_generic_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 355, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__26);
-            return ret;
-        },
-        __wbindgen_generic_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 355, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 356, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__27);
             return ret;
         },
+        __wbindgen_generic_0000000000000004: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 356, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__28);
+            return ret;
+        },
         __wbindgen_generic_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 456, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 457, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_e1363021040f656a___convert__closures_____invoke_______true__1_);
             return ret;
         },
@@ -1021,12 +1044,12 @@ function wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bin
     wasm.wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true_(arg0, arg1, arg2);
 }
 
-function wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__26(arg0, arg1, arg2) {
-    wasm.wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__26(arg0, arg1, arg2);
-}
-
 function wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__27(arg0, arg1, arg2) {
     wasm.wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__27(arg0, arg1, arg2);
+}
+
+function wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__28(arg0, arg1, arg2) {
+    wasm.wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__28(arg0, arg1, arg2);
 }
 
 function wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_e1363021040f656a___JsError___true_(arg0, arg1, arg2) {

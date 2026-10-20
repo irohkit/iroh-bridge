@@ -2,6 +2,7 @@ import { IrohClient, enableLogging } from "../wasm/web_client.js";
 import { CookieJar } from "./cookies.js";
 import { IrohEventSource } from "./eventsource.js";
 import { IrohWebSocket } from "./websocket.js";
+import { IrohXMLHttpRequest, routedXMLHttpRequest } from "./xhr.js";
 
 // Responses with these statuses must not carry a body in the Fetch API.
 const NULL_BODY_STATUS = new Set([101, 103, 204, 205, 304]);
@@ -22,6 +23,8 @@ export function makeCreate(init) {
     const {
       relayUrl,
       relayToken,
+      secretKey,
+      persistIdentity = false,
       logLevel,
       connect = true,
       connectTimeout = 15_000,
@@ -35,7 +38,19 @@ export function makeCreate(init) {
     if (logLevel) enableLogging(logLevel);
     // One local endpoint serves every gateway; each gateway gets its own connection.
     if (relayToken && !relayUrl) throw new Error("iroh-fetch: relayToken needs relayUrl");
-    const client = await IrohClient.create(relayUrl ?? undefined, relayToken ?? undefined);
+    // A fixed identity lets gateways allow-list or rate-limit this client by endpoint id.
+    const idStore = persistIdentity ? (persistIdentity === true ? globalThis.localStorage : persistIdentity) : undefined;
+    const idKey = "iroh-fetch:secret-key";
+    let storedKey;
+    try {
+      storedKey = idStore?.getItem(idKey) ?? undefined;
+    } catch {}
+    const client = await IrohClient.create(relayUrl ?? undefined, relayToken ?? undefined, secretKey ?? storedKey ?? undefined);
+    if (idStore && !storedKey && !secretKey) {
+      try {
+        idStore.setItem(idKey, client.secretKey());
+      } catch {}
+    }
 
     const storage = persistCookies ? (persistCookies === true ? globalThis.localStorage : persistCookies) : undefined;
     for (const b of backends) {
@@ -97,6 +112,11 @@ export function makeCreate(init) {
           super(irohFetch, String(url), init);
         }
       }
+      class XMLHttpRequest extends IrohXMLHttpRequest {
+        constructor() {
+          super(irohFetch);
+        }
+      }
       return {
         fetch: irohFetch,
         websocket: (path, { protocols, headers } = {}) => {
@@ -114,6 +134,7 @@ export function makeCreate(init) {
         },
         WebSocket,
         EventSource,
+        XMLHttpRequest,
       };
     };
 
@@ -151,6 +172,8 @@ export function makeCreate(init) {
       },
       cookies: cookieApi(backends[0].jar),
       endpointId: client.endpointId(),
+      /** This client's secret key (hex), to give it the same endpoint id next time. Keep it secret. */
+      exportSecretKey: () => client.secretKey(),
       close: () => client.close(),
     };
   };
@@ -383,7 +406,7 @@ async function fetchOverIroh(client, route, forced, input, init) {
  * Routes the global fetch (and optionally WebSocket / EventSource) through iroh for matching
  * URLs, so existing code and libraries keep working unchanged. Returns an uninstall function.
  */
-function install(impl, { origins = [], match, websocket = true, eventSource = true } = {}) {
+function install(impl, { origins = [], match, websocket = true, eventSource = true, xhr = true } = {}) {
   // Origins must be absolute: a bare "api.example.com" would resolve against the page's URL and
   // silently send the page's own origin (and its credentials) to the gateway.
   const wanted = origins.map((o) => {
@@ -402,7 +425,13 @@ function install(impl, { origins = [], match, websocket = true, eventSource = tr
     }
   };
 
-  const saved = { fetch: globalThis.fetch, WebSocket: globalThis.WebSocket, EventSource: globalThis.EventSource };
+  const saved = {
+    fetch: globalThis.fetch,
+    WebSocket: globalThis.WebSocket,
+    EventSource: globalThis.EventSource,
+    XMLHttpRequest: globalThis.XMLHttpRequest,
+  };
+  if (xhr) globalThis.XMLHttpRequest = routedXMLHttpRequest(saved.XMLHttpRequest, () => new impl.XMLHttpRequest(), test);
   globalThis.fetch = function fetch(input, init) {
     const url = input instanceof Request ? input.url : String(input);
     return test(url) ? impl.fetch(input, init) : saved.fetch.call(this, input, init);
@@ -428,6 +457,10 @@ function install(impl, { origins = [], match, websocket = true, eventSource = tr
   return function uninstall() {
     globalThis.fetch = saved.fetch;
     if (websocket && saved.WebSocket) globalThis.WebSocket = saved.WebSocket;
+    if (xhr) {
+      if (saved.XMLHttpRequest) globalThis.XMLHttpRequest = saved.XMLHttpRequest;
+      else delete globalThis.XMLHttpRequest;
+    }
     if (eventSource) {
       if (saved.EventSource) globalThis.EventSource = saved.EventSource;
       else delete globalThis.EventSource;

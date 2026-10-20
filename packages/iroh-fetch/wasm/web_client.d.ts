@@ -52,8 +52,11 @@ export class IrohClient {
      * Create a local endpoint that can talk to any number of gateways.
      * `relay_url` must match the gateways' relay if they use a custom one; `relay_token` is
      * for relays that only admit clients with a token.
+     *
+     * `secret_key` (64 hex chars) gives the client a fixed endpoint id; without it a new one is
+     * generated, which `secretKey()` returns so it can be kept.
      */
-    static create(relay_url?: string | null, relay_token?: string | null): Promise<IrohClient>;
+    static create(relay_url?: string | null, relay_token?: string | null, secret_key?: string | null): Promise<IrohClient>;
     /**
      * This client's own endpoint id.
      */
@@ -70,6 +73,11 @@ export class IrohClient {
      * streams in as the backend produces it.
      */
     request(remote: string, method: string, path: string, headers: any, body: any): Promise<any>;
+    /**
+     * This client's secret key as hex, to keep its endpoint id across sessions. Treat it like a
+     * password: whoever has it can act as this client.
+     */
+    secretKey(): string;
     /**
      * Open a WebSocket to `path` on the backend. Resolves to `{ status, headers, socket }` where
      * `socket` is set only when the backend accepted the upgrade (status 101); otherwise `body`
@@ -124,14 +132,15 @@ export interface InitOutput {
     readonly intounderlyingsink_close: (a: number) => any;
     readonly intounderlyingsink_write: (a: number, b: any) => any;
     readonly intounderlyingsource_cancel: (a: number) => void;
-    readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly intounderlyingsource_pull: (a: number, b: any) => any;
+    readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly irohclient_close: (a: number) => any;
     readonly irohclient_connect: (a: number, b: number, c: number) => any;
-    readonly irohclient_create: (a: number, b: number, c: number, d: number) => any;
+    readonly irohclient_create: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
     readonly irohclient_endpointId: (a: number) => [number, number];
     readonly irohclient_relayProblem: (a: number) => [number, number];
     readonly irohclient_request: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: any, i: any) => any;
+    readonly irohclient_secretKey: (a: number) => [number, number];
     readonly irohclient_websocket: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
     readonly start: () => void;
     readonly websocketconn_close: (a: number, b: number, c: number, d: number) => any;
@@ -141,8 +150,8 @@ export interface InitOutput {
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___js_sys_7533570554f6805f___Function_fn_wasm_bindgen_e1363021040f656a___JsValue_____wasm_bindgen_e1363021040f656a___sys__Undefined___js_sys_7533570554f6805f___Function_fn_wasm_bindgen_e1363021040f656a___JsValue_____wasm_bindgen_e1363021040f656a___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_e1363021040f656a___JsError___true_: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true_: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__26: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__27: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke___wasm_bindgen_e1363021040f656a___JsValue______true__28: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke_______true_: (a: number, b: number) => void;
     readonly wasm_bindgen_e1363021040f656a___convert__closures_____invoke_______true__1_: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;

@@ -48,8 +48,18 @@ impl IrohClient {
     /// Create a local endpoint that can talk to any number of gateways.
     /// `relay_url` must match the gateways' relay if they use a custom one; `relay_token` is
     /// for relays that only admit clients with a token.
-    pub async fn create(relay_url: Option<String>, relay_token: Option<String>) -> Result<IrohClient, JsError> {
+    ///
+    /// `secret_key` (64 hex chars) gives the client a fixed endpoint id; without it a new one is
+    /// generated, which `secretKey()` returns so it can be kept.
+    pub async fn create(
+        relay_url: Option<String>,
+        relay_token: Option<String>,
+        secret_key: Option<String>,
+    ) -> Result<IrohClient, JsError> {
         let mut builder = Endpoint::builder(presets::N0);
+        if let Some(hex) = secret_key.filter(|k| !k.is_empty()) {
+            builder = builder.secret_key(parse_secret_key(&hex).map_err(js)?);
+        }
         if let Some(url) = relay_url.filter(|u| !u.is_empty()) {
             let url: RelayUrl = url.parse().context("invalid relay url").map_err(js)?;
             let mut relay = iroh::RelayConfig::from(url);
@@ -75,6 +85,13 @@ impl IrohClient {
             }
             status.last_error().map(|err| format!("relay {} is unreachable: {err}", status.url()))
         })
+    }
+
+    /// This client's secret key as hex, to keep its endpoint id across sessions. Treat it like a
+    /// password: whoever has it can act as this client.
+    #[wasm_bindgen(js_name = secretKey)]
+    pub fn secret_key(&self) -> String {
+        self.0.endpoint.secret_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// This client's own endpoint id.
@@ -341,6 +358,16 @@ fn body_stream(recv: RecvStream) -> wasm_streams::readable::sys::ReadableStream 
         }
     });
     wasm_streams::ReadableStream::from_stream(chunks.boxed_local()).into_raw()
+}
+
+fn parse_secret_key(hex: &str) -> Result<iroh::SecretKey> {
+    let hex = hex.trim();
+    anyhow::ensure!(hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()), "secret key must be 64 hex characters");
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)?;
+    }
+    Ok(iroh::SecretKey::from_bytes(&bytes))
 }
 
 fn parse_remote(remote: &str) -> Result<EndpointId, JsValue> {

@@ -2,8 +2,10 @@
 
 use std::{
     collections::HashSet,
+    fmt::Write as _,
     future::Future,
     io::{Read, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -15,7 +17,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use iroh::{
-    Endpoint, EndpointId, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher as _,
     endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, VarInt, presets},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -116,6 +118,15 @@ struct Args {
     /// Streaming responses such as SSE are not limited once they started.
     #[arg(long, env = "UPSTREAM_TIMEOUT_SECS", default_value_t = 300)]
     upstream_timeout_secs: u64,
+    /// Serve /healthz, /readyz, /status and /metrics over plain HTTP on this address, e.g.
+    /// 127.0.0.1:9180. Off by default. It has no authentication, so only loopback addresses are
+    /// accepted unless --admin-allow-public is given.
+    #[arg(long, env = "IROH_ADMIN_ADDR", value_name = "ADDR")]
+    admin_addr: Option<SocketAddr>,
+    /// Allow --admin-addr to be a non-loopback address. It exposes upstream URLs and traffic
+    /// figures to anyone who can reach it, so put a firewall or authenticating proxy in front.
+    #[arg(long, env = "IROH_ADMIN_ALLOW_PUBLIC", requires = "admin_addr")]
+    admin_allow_public: bool,
 }
 
 /// `0` in a timeout option means "no limit".
@@ -131,6 +142,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "iroh_gateway=info".into()),
         )
         .init();
+    let started = Instant::now();
     let args = Args::parse();
     let router = Router::parse(&args.routes, args.backend.as_deref(), Duration::from_secs(args.upstream_cooldown_secs))?;
     let allow_clients = args
@@ -149,6 +161,17 @@ async fn main() -> Result<()> {
         .collect::<Result<_>>()?;
     anyhow::ensure!(args.max_connections > 0 && args.max_requests > 0, "connection and request limits must be at least 1");
     anyhow::ensure!(args.max_streams_per_connection > 0, "--max-streams-per-connection must be at least 1");
+    // Bound before anything else so a typo or a taken port fails the start, not just the listener.
+    let admin_listener = match args.admin_addr {
+        Some(addr) => {
+            check_admin_addr(addr, args.admin_allow_public)?;
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding admin listener on {addr}"))?;
+            Some(listener)
+        }
+        None => None,
+    };
     let secret_key = load_or_create_key(&args.key_file)?;
 
     // The protocol only uses bidirectional streams, so clients get no unidirectional ones.
@@ -169,17 +192,6 @@ async fn main() -> Result<()> {
         builder = builder.relay_mode(RelayMode::Custom(relay.into()));
     }
     let endpoint = builder.bind().await?;
-    endpoint.online().await;
-
-    router.log_config();
-    if !allow_clients.is_empty() {
-        let ids: Vec<_> = allow_clients.iter().map(|id| id.fmt_short().to_string()).collect();
-        info!("accepting only clients {}", ids.join(", "));
-    }
-    if !allow_paths.is_empty() {
-        info!("serving only paths under {}", allow_paths.iter().map(|p| if p.is_empty() { "/" } else { p }).collect::<Vec<_>>().join(", "));
-    }
-    println!("\nIROH_ENDPOINT_ID={}\n", endpoint.id());
 
     let upstream_connect_timeout = Duration::from_secs(args.upstream_connect_timeout_secs.max(1));
     let http = reqwest::Client::builder()
@@ -202,7 +214,32 @@ async fn main() -> Result<()> {
         upstream_connect_timeout,
         upstream_timeout: limit_secs(args.upstream_timeout_secs),
         busy_log: LogThrottle::default(),
+        metrics: Metrics::default(),
     });
+
+    // Started before waiting for a relay, so /healthz answers 503 during a slow start instead
+    // of hanging.
+    if let Some(listener) = admin_listener {
+        let addr = listener.local_addr()?;
+        if args.admin_allow_public && !is_loopback(addr) {
+            warn!("admin listener on http://{addr} is reachable from the network and has no authentication");
+        } else {
+            info!("admin listener on http://{addr}");
+        }
+        let admin = Arc::new(Admin { ctx: ctx.clone(), endpoint: endpoint.clone(), relay_url: args.relay_url.clone(), started });
+        tokio::spawn(serve_admin(listener, admin));
+    }
+    endpoint.online().await;
+
+    ctx.router.log_config();
+    if !ctx.allow_clients.is_empty() {
+        let ids: Vec<_> = ctx.allow_clients.iter().map(|id| id.fmt_short().to_string()).collect();
+        info!("accepting only clients {}", ids.join(", "));
+    }
+    if !ctx.allow_paths.is_empty() {
+        info!("serving only paths under {}", ctx.allow_paths.iter().map(|p| if p.is_empty() { "/" } else { p.as_str() }).collect::<Vec<_>>().join(", "));
+    }
+    println!("\nIROH_ENDPOINT_ID={}\n", endpoint.id());
 
     let connections = Arc::new(Semaphore::new(args.max_connections));
     let full_log = LogThrottle::default();
@@ -218,6 +255,7 @@ async fn main() -> Result<()> {
                     if full_log.allow() {
                         warn!("connection limit ({}) reached, refusing new connections", args.max_connections);
                     }
+                    ctx.metrics.reject(Reject::ConnectionLimit);
                     incoming.refuse();
                     continue;
                 };
@@ -294,6 +332,7 @@ struct Ctx {
     upstream_connect_timeout: Duration,
     upstream_timeout: Option<Duration>,
     busy_log: LogThrottle,
+    metrics: Metrics,
 }
 
 /// Picks the upstreams for a request from its host and path.
@@ -379,6 +418,14 @@ impl Router {
             .find(|r| r.host.as_deref().is_none_or(|h| Some(h) == host) && prefix_matches(&r.prefix, path))
             .map(|r| (r.label.as_str(), &r.upstreams))
             .or_else(|| self.default.as_ref().map(|d| ("default", d)))
+    }
+
+    /// Every route with its label, the default backend last, for the admin listener.
+    fn all(&self) -> impl Iterator<Item = (&str, &Upstreams)> {
+        self.routes
+            .iter()
+            .map(|r| (r.label.as_str(), &r.upstreams))
+            .chain(self.default.as_ref().map(|d| ("default", d)))
     }
 }
 
@@ -529,6 +576,10 @@ struct Upstreams {
     failed: Mutex<Vec<Option<Instant>>>,
     next: AtomicUsize,
     cooldown: Duration,
+    /// Connect failures per upstream, for `iroh_gateway_upstream_failures_total`.
+    failures: Vec<AtomicU64>,
+    /// Traffic of the route these upstreams belong to.
+    stats: RouteStats,
 }
 
 impl Upstreams {
@@ -539,7 +590,23 @@ impl Upstreams {
             .filter(|u| !u.is_empty())
             .collect();
         anyhow::ensure!(!urls.is_empty(), "no backend URL given");
-        Ok(Self { failed: Mutex::new(vec![None; urls.len()]), urls, next: AtomicUsize::new(0), cooldown })
+        Ok(Self {
+            failed: Mutex::new(vec![None; urls.len()]),
+            failures: urls.iter().map(|_| AtomicU64::new(0)).collect(),
+            urls,
+            next: AtomicUsize::new(0),
+            cooldown,
+            stats: RouteStats::default(),
+        })
+    }
+
+    /// The cooldown left for each upstream; `None` means healthy.
+    fn health(&self) -> Vec<Option<Duration>> {
+        let failed = self.failed.lock().unwrap();
+        failed
+            .iter()
+            .map(|at| at.and_then(|at| self.cooldown.checked_sub(at.elapsed())).filter(|left| !left.is_zero()))
+            .collect()
     }
 
     /// The order to try upstreams in for one request: healthy ones round-robin, then the ones in
@@ -562,6 +629,7 @@ impl Upstreams {
     }
 
     fn mark_failed(&self, i: usize, err: &dyn std::fmt::Display) {
+        self.failures[i].fetch_add(1, Ordering::Relaxed);
         let mut failed = self.failed.lock().unwrap();
         // Only announce the transition; concurrent requests hitting the same dead upstream would
         // otherwise log it once each.
@@ -584,10 +652,12 @@ async fn handle_connection(ctx: Arc<Ctx>, conn: Connection) {
     // The id is only known once the handshake has verified it, so refuse right after.
     if !ctx.allow_clients.is_empty() && !ctx.allow_clients.contains(&remote) {
         warn!(remote = %remote.fmt_short(), "client not in allow list, closing connection");
+        ctx.metrics.reject(Reject::ClientNotAllowed);
         conn.close(VarInt::from_u32(1), b"not allowed");
         return;
     }
     info!(remote = %remote.fmt_short(), "client connected");
+    let _connected = GaugeGuard::new(&ctx.metrics.connections);
     // Each request arrives on its own bidirectional stream, so requests run concurrently.
     while let Ok((mut send, recv)) = conn.accept_bi().await {
         let ctx = ctx.clone();
@@ -595,6 +665,8 @@ async fn handle_connection(ctx: Arc<Ctx>, conn: Connection) {
             if ctx.busy_log.allow() {
                 warn!("request limit ({}) reached, answering 503", ctx.max_requests);
             }
+            ctx.metrics.reject(Reject::TooManyRequests);
+            Outcome::new(&ctx.metrics).head(503);
             // Answer without reading the head; dropping `recv` discards whatever else comes.
             tokio::spawn(async move {
                 let _ = respond_text(&ctx, &mut send, 503, "gateway busy, try again").await;
@@ -624,23 +696,24 @@ async fn with_limit<F: Future>(limit: Option<Duration>, fut: F) -> Option<F::Out
 }
 
 async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mut recv: RecvStream) -> Result<()> {
+    let mut out = Outcome::new(&ctx.metrics);
     let mut head: RequestHead = match with_limit(ctx.head_timeout, proto::read_head_limited(&mut recv, ctx.max_head)).await {
         Some(Ok(head)) => head,
         Some(Err(err)) => {
             info!(remote = %remote.fmt_short(), "unreadable request head: {err:#}");
             return match err.downcast_ref::<proto::TooLarge>() {
-                Some(_) => respond_text(ctx, send, 431, "request head too large").await,
-                None => respond_text(ctx, send, 400, "bad request: malformed head").await,
+                Some(_) => reply(ctx, &mut out, send, Reject::HeadTooLarge, 431, "request head too large").await,
+                None => reply(ctx, &mut out, send, Reject::BadRequest, 400, "bad request: malformed head").await,
             };
         }
         None => {
             info!(remote = %remote.fmt_short(), "request head not received in time");
-            return respond_text(ctx, send, 408, "request head timeout").await;
+            return reply(ctx, &mut out, send, Reject::HeadTimeout, 408, "request head timeout").await;
         }
     };
     if let Err(reason) = validate_head(&head) {
         info!("{} {} -> 400 ({reason})", for_log(&head.method), path_for_log(&head.path));
-        return respond_text(ctx, send, 400, &format!("bad request: {reason}")).await;
+        return reply(ctx, &mut out, send, Reject::BadRequest, 400, &format!("bad request: {reason}")).await;
     }
     // From here on method, path and headers are known to be printable, so they can be logged as-is.
     let method = if head.websocket { "WS" } else { head.method.as_str() };
@@ -650,22 +723,23 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mu
     // checks, before any upstream is contacted.
     if !ctx.allow_paths.is_empty() && !ctx.allow_paths.iter().any(|p| prefix_matches(p, path)) {
         info!("{method} {} -> 403 (path not allowed)", path_for_log(&head.path));
-        return respond_text(ctx, send, 403, "forbidden").await;
+        return reply(ctx, &mut out, send, Reject::PathNotAllowed, 403, "forbidden").await;
     }
     let Some((route, upstreams)) = ctx.router.select(host.as_deref().map(normalize_host).as_deref(), path) else {
         info!("{method} {} -> 404 (no route for host {})", path_for_log(&head.path), host.as_deref().unwrap_or("-"));
-        return respond_text(ctx, send, 404, "no route for this host or path").await;
+        return reply(ctx, &mut out, send, Reject::NoRoute, 404, "no route for this host or path").await;
     };
+    out.stats = Some(&upstreams.stats);
     head.headers = proxy_headers(head.headers, remote, host.as_deref());
     if head.websocket {
-        return handle_websocket(ctx, upstreams, route, head, send, recv).await;
+        return handle_websocket(ctx, upstreams, route, head, send, recv, &mut out).await;
     }
     let upload = Arc::new(Upload::new());
     let body = match with_limit(ctx.body_idle_timeout, recv.read_chunk(CHUNK_SIZE)).await {
         Some(first) => request_body(recv, first?, ctx.max_body, ctx.body_idle_timeout, upload.clone()),
         None => {
             info!("{} {} -> 408 (no request body received)", head.method, path_for_log(&head.path));
-            return respond_text(ctx, send, 408, "request body timeout").await;
+            return reply(ctx, &mut out, send, Reject::BodyTimeout, 408, "request body timeout").await;
         }
     };
 
@@ -687,15 +761,22 @@ async fn handle_request(ctx: &Ctx, remote: EndpointId, send: &mut SendStream, mu
                 Some(failure) => failure,
                 None => (502, "bad gateway"),
             };
+            match status {
+                413 => ctx.metrics.reject(Reject::BodyTooLarge),
+                408 => ctx.metrics.reject(Reject::BodyTimeout),
+                _ => {}
+            }
             warn!("{} {} -> {status} (route {route}): {err:#}", head.method, path_for_log(&head.path));
+            out.head(status);
             return respond_text(ctx, send, status, text).await;
         }
         None => {
             warn!("{} {} -> 504: backend did not answer in time (route {route})", head.method, path_for_log(&head.path));
-            return respond_text(ctx, send, 504, "gateway timeout").await;
+            return reply(ctx, &mut out, send, Reject::UpstreamTimeout, 504, "gateway timeout").await;
         }
     };
     info!("{} {} -> {} via {upstream} (route {route})", head.method, path_for_log(&head.path), resp.status().as_u16());
+    out.head(resp.status().as_u16());
 
     let mut headers = header_pairs(resp.headers());
     headers.push(("x-iroh-gateway-id".into(), ctx.gateway_id.clone()));
@@ -780,6 +861,7 @@ async fn handle_websocket(
     head: RequestHead,
     send: &mut SendStream,
     mut recv: RecvStream,
+    out: &mut Outcome<'_>,
 ) -> Result<()> {
     // A handshake has no body, so a connect failure can always move on to the next upstream.
     let mut attempt = None;
@@ -812,13 +894,16 @@ async fn handle_websocket(
             let (status, headers, body) = match err {
                 tungstenite::Error::Http(resp) => {
                     warn!("WS {} -> {} via {upstream} (route {route})", path_for_log(&head.path), resp.status().as_u16());
+                    upstreams.stats.ws_result(WsResult::Refused);
                     (resp.status().as_u16(), header_pairs(resp.headers()), resp.body().clone().unwrap_or_default())
                 }
                 err => {
                     warn!("WS {} -> 502 via {upstream} (route {route}): {err}", path_for_log(&head.path));
+                    upstreams.stats.ws_result(WsResult::Failed);
                     (502, vec![("content-type".into(), "text/plain".into())], b"bad gateway".to_vec())
                 }
             };
+            out.head(status);
             proto::write_head(send, &ResponseHead { status, headers }).await?;
             send.write_all(&body).await?;
             send.finish()?;
@@ -826,6 +911,8 @@ async fn handle_websocket(
         }
     };
     info!("WS {} -> 101 via {upstream} (route {route})", path_for_log(&head.path));
+    upstreams.stats.ws_result(WsResult::Upgraded);
+    out.head(101);
     let headers = header_pairs(resp.headers())
         .into_iter()
         .filter(|(k, _)| !WS_HANDSHAKE_HEADERS.contains(&k.as_str()))
@@ -922,6 +1009,13 @@ async fn respond_text(ctx: &Ctx, send: &mut SendStream, status: u16, body: &str)
     send.write_all(body.as_bytes()).await?;
     send.finish()?;
     Ok(())
+}
+
+/// `respond_text` for a request the gateway turns away, counted under `reason`.
+async fn reply(ctx: &Ctx, out: &mut Outcome<'_>, send: &mut SendStream, reason: Reject, status: u16, body: &str) -> Result<()> {
+    ctx.metrics.reject(reason);
+    out.head(status);
+    respond_text(ctx, send, status, body).await
 }
 
 fn ws_request(upstream: &str, head: &RequestHead) -> Result<tungstenite::handshake::client::Request> {
@@ -1074,6 +1168,425 @@ async fn forward(ctx: &Ctx, upstream: &str, head: &RequestHead, body: Option<req
         req = req.body(body);
     }
     Ok(req.send().await?)
+}
+
+/// Why the gateway turned a connection or request away, for `iroh_gateway_rejected_total`.
+#[derive(Clone, Copy)]
+enum Reject {
+    ClientNotAllowed,
+    ConnectionLimit,
+    TooManyRequests,
+    BadRequest,
+    HeadTooLarge,
+    HeadTimeout,
+    PathNotAllowed,
+    NoRoute,
+    BodyTooLarge,
+    BodyTimeout,
+    UpstreamTimeout,
+}
+
+impl Reject {
+    const ALL: [Reject; 11] = [
+        Reject::ClientNotAllowed, Reject::ConnectionLimit, Reject::TooManyRequests, Reject::BadRequest,
+        Reject::HeadTooLarge, Reject::HeadTimeout, Reject::PathNotAllowed, Reject::NoRoute,
+        Reject::BodyTooLarge, Reject::BodyTimeout, Reject::UpstreamTimeout,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Reject::ClientNotAllowed => "client_not_allowed",
+            Reject::ConnectionLimit => "connection_limit",
+            Reject::TooManyRequests => "too_many_requests",
+            Reject::BadRequest => "bad_request",
+            Reject::HeadTooLarge => "head_too_large",
+            Reject::HeadTimeout => "head_timeout",
+            Reject::PathNotAllowed => "path_not_allowed",
+            Reject::NoRoute => "no_route",
+            Reject::BodyTooLarge => "body_too_large",
+            Reject::BodyTimeout => "body_timeout",
+            Reject::UpstreamTimeout => "upstream_timeout",
+        }
+    }
+}
+
+/// How a WebSocket handshake with the backend ended; indexes `WS_RESULTS`.
+#[derive(Clone, Copy)]
+enum WsResult {
+    Upgraded,
+    /// The backend answered with an HTTP status instead of upgrading.
+    Refused,
+    /// No backend could be reached.
+    Failed,
+}
+
+const WS_RESULTS: [&str; 3] = ["upgraded", "refused", "failed"];
+const STATUS_CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
+/// Upper bounds of the request duration histogram in seconds; one more bucket takes the rest.
+const DURATION_BUCKETS: [f64; 9] = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+/// Route label for requests answered before a route was picked.
+const UNROUTED: &str = "unrouted";
+
+/// Counters for one route, or for requests that never got one. Plain atomics in fixed slots,
+/// so counting a request takes no lock and no allocation.
+#[derive(Default)]
+struct RouteStats {
+    /// Responses by status class; 1xx is WebSocket upgrades.
+    responses: [AtomicU64; 5],
+    websockets: [AtomicU64; 3],
+}
+
+impl RouteStats {
+    fn response(&self, status: u16) {
+        let class = usize::from(status / 100).clamp(1, 5) - 1;
+        self.responses[class].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn ws_result(&self, result: WsResult) {
+        self.websockets[result as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct Metrics {
+    /// Established client connections, after the allow list check.
+    connections: AtomicUsize,
+    unrouted: RouteStats,
+    rejected: [AtomicU64; Reject::ALL.len()],
+    /// Histogram buckets, not cumulative; the last one is everything above the largest bound.
+    durations: [AtomicU64; DURATION_BUCKETS.len() + 1],
+    duration_sum_micros: AtomicU64,
+}
+
+impl Metrics {
+    fn reject(&self, reason: Reject) {
+        self.rejected[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe(&self, took: Duration) {
+        let secs = took.as_secs_f64();
+        let bucket = DURATION_BUCKETS.iter().position(|&le| secs <= le).unwrap_or(DURATION_BUCKETS.len());
+        self.durations[bucket].fetch_add(1, Ordering::Relaxed);
+        self.duration_sum_micros.fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Counts one request once its response head is known: status class and time to the head.
+struct Outcome<'a> {
+    metrics: &'a Metrics,
+    started: Instant,
+    /// The matched route's counters; `None` until the request is routed.
+    stats: Option<&'a RouteStats>,
+    recorded: bool,
+}
+
+impl<'a> Outcome<'a> {
+    fn new(metrics: &'a Metrics) -> Self {
+        Self { metrics, started: Instant::now(), stats: None, recorded: false }
+    }
+
+    /// Called right before the response head goes out; later calls are ignored.
+    fn head(&mut self, status: u16) {
+        if std::mem::replace(&mut self.recorded, true) {
+            return;
+        }
+        self.metrics.observe(self.started.elapsed());
+        self.stats.unwrap_or(&self.metrics.unrouted).response(status);
+    }
+}
+
+/// Keeps a gauge raised while it lives, so every exit path lowers it again.
+struct GaugeGuard<'a>(&'a AtomicUsize);
+
+impl<'a> GaugeGuard<'a> {
+    fn new(gauge: &'a AtomicUsize) -> Self {
+        gauge.fetch_add(1, Ordering::Relaxed);
+        Self(gauge)
+    }
+}
+
+impl Drop for GaugeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A label value in the Prometheus text format. Values only come from the configuration
+/// (route labels, upstream URLs), never from requests, but a quote or backslash in them must
+/// still not break the exposition.
+fn prom_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The `/metrics` page. Writing to a `String` can't fail, hence the ignored results.
+fn render_metrics(router: &Router, metrics: &Metrics, inflight: usize) -> String {
+    let mut out = String::new();
+    let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+    let routes: Vec<(&str, &Upstreams)> = router.all().collect();
+
+    let _ = writeln!(out, "# HELP iroh_gateway_requests_total Requests answered, by route and status class.");
+    let _ = writeln!(out, "# TYPE iroh_gateway_requests_total counter");
+    let stats = routes.iter().map(|(label, u)| (*label, &u.stats)).chain([(UNROUTED, &metrics.unrouted)]);
+    for (label, stats) in stats {
+        for (class, count) in STATUS_CLASSES.iter().zip(&stats.responses) {
+            let _ = writeln!(out, "iroh_gateway_requests_total{{route=\"{}\",status_class=\"{class}\"}} {}", prom_label(label), get(count));
+        }
+    }
+
+    let _ = writeln!(out, "# HELP iroh_gateway_websocket_upgrades_total WebSocket handshakes with a backend, by route and result.");
+    let _ = writeln!(out, "# TYPE iroh_gateway_websocket_upgrades_total counter");
+    for (label, upstreams) in &routes {
+        for (result, count) in WS_RESULTS.iter().zip(&upstreams.stats.websockets) {
+            let _ = writeln!(out, "iroh_gateway_websocket_upgrades_total{{route=\"{}\",result=\"{result}\"}} {}", prom_label(label), get(count));
+        }
+    }
+
+    // The route is part of these labels because the same URL may serve several routes, each
+    // with its own health state.
+    let _ = writeln!(out, "# HELP iroh_gateway_upstream_failures_total Failed connection attempts to an upstream.");
+    let _ = writeln!(out, "# TYPE iroh_gateway_upstream_failures_total counter");
+    for (label, upstreams) in &routes {
+        for (url, count) in upstreams.urls.iter().zip(&upstreams.failures) {
+            let _ = writeln!(out, "iroh_gateway_upstream_failures_total{{route=\"{}\",upstream=\"{}\"}} {}", prom_label(label), prom_label(url), get(count));
+        }
+    }
+    let _ = writeln!(out, "# HELP iroh_gateway_upstream_healthy Whether an upstream is out of its failure cooldown (1) or not (0).");
+    let _ = writeln!(out, "# TYPE iroh_gateway_upstream_healthy gauge");
+    for (label, upstreams) in &routes {
+        for (url, left) in upstreams.urls.iter().zip(upstreams.health()) {
+            let _ = writeln!(out, "iroh_gateway_upstream_healthy{{route=\"{}\",upstream=\"{}\"}} {}", prom_label(label), prom_label(url), u8::from(left.is_none()));
+        }
+    }
+
+    let _ = writeln!(out, "# HELP iroh_gateway_rejected_total Connections and requests the gateway turned away, by reason.");
+    let _ = writeln!(out, "# TYPE iroh_gateway_rejected_total counter");
+    for (reason, count) in Reject::ALL.iter().zip(&metrics.rejected) {
+        let _ = writeln!(out, "iroh_gateway_rejected_total{{reason=\"{}\"}} {}", reason.label(), get(count));
+    }
+
+    let _ = writeln!(out, "# HELP iroh_gateway_connections Established client connections.");
+    let _ = writeln!(out, "# TYPE iroh_gateway_connections gauge");
+    let _ = writeln!(out, "iroh_gateway_connections {}", metrics.connections.load(Ordering::Relaxed));
+    let _ = writeln!(out, "# HELP iroh_gateway_inflight_requests Requests and WebSockets in progress.");
+    let _ = writeln!(out, "# TYPE iroh_gateway_inflight_requests gauge");
+    let _ = writeln!(out, "iroh_gateway_inflight_requests {inflight}");
+
+    let _ = writeln!(out, "# HELP iroh_gateway_request_duration_seconds Time from a request's start to its response head.");
+    let _ = writeln!(out, "# TYPE iroh_gateway_request_duration_seconds histogram");
+    let mut total = 0;
+    for (i, count) in metrics.durations.iter().enumerate() {
+        total += get(count);
+        let le = DURATION_BUCKETS.get(i).map_or("+Inf".to_string(), |le| le.to_string());
+        let _ = writeln!(out, "iroh_gateway_request_duration_seconds_bucket{{le=\"{le}\"}} {total}");
+    }
+    let sum = get(&metrics.duration_sum_micros) as f64 / 1e6;
+    let _ = writeln!(out, "iroh_gateway_request_duration_seconds_sum {sum}");
+    let _ = writeln!(out, "iroh_gateway_request_duration_seconds_count {total}");
+    out
+}
+
+/// At most this many admin connections are served at once; more are closed right away.
+const ADMIN_MAX_CONNECTIONS: usize = 16;
+/// Largest admin request head accepted. The endpoints take no input, so this is generous.
+const ADMIN_MAX_HEAD: usize = 8 * 1024;
+/// Time limit for a whole admin exchange, so a client that never finishes can't hold a slot.
+const ADMIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the admin listener reports on.
+struct Admin {
+    ctx: Arc<Ctx>,
+    endpoint: Endpoint,
+    /// The relay configured with `--relay-url`, if any.
+    relay_url: Option<RelayUrl>,
+    started: Instant,
+}
+
+/// IPv4-mapped addresses like `::ffff:127.0.0.1` count as loopback too.
+fn is_loopback(addr: SocketAddr) -> bool {
+    addr.ip().to_canonical().is_loopback()
+}
+
+/// The admin listener has no authentication and shows upstream URLs and traffic, so a
+/// non-loopback address (including 0.0.0.0) needs an explicit opt-in.
+fn check_admin_addr(addr: SocketAddr, allow_public: bool) -> Result<()> {
+    anyhow::ensure!(
+        allow_public || is_loopback(addr),
+        "--admin-addr {addr} is not a loopback address; the admin listener has no authentication, \
+         so also pass --admin-allow-public if it really should be reachable from the network"
+    );
+    Ok(())
+}
+
+async fn serve_admin(listener: tokio::net::TcpListener, admin: Arc<Admin>) {
+    let slots = Arc::new(Semaphore::new(ADMIN_MAX_CONNECTIONS));
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                // Usually out of file descriptors; back off instead of spinning.
+                warn!("admin listener: accept failed: {err}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
+        let admin = admin.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _ = tokio::time::timeout(ADMIN_TIMEOUT, admin_connection(&admin, stream)).await;
+        });
+    }
+}
+
+/// Answers one request and closes the connection.
+async fn admin_connection(admin: &Admin, mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    // The whole head is read before answering: closing a socket with unread data makes the
+    // kernel send a reset, which can cut off the response.
+    let (status, content_type, body) = loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]);
+            let mut parts = head.lines().next().unwrap_or_default().split(' ');
+            let (method, target) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+            break admin_response(admin, method, path_only(target));
+        }
+        if buf.len() >= ADMIN_MAX_HEAD {
+            break (431, ADMIN_TEXT, "request head too large\n".to_string());
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        431 => "Request Header Fields Too Large",
+        _ => "Service Unavailable",
+    };
+    let allow = if status == 405 { "Allow: GET\r\n" } else { "" };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\n{allow}Connection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+const ADMIN_TEXT: &str = "text/plain; charset=utf-8";
+
+fn admin_response(admin: &Admin, method: &str, path: &str) -> (u16, &'static str, String) {
+    if !matches!(path, "/healthz" | "/readyz" | "/status" | "/metrics") {
+        return (404, ADMIN_TEXT, "not found\n".into());
+    }
+    if method != "GET" {
+        return (405, ADMIN_TEXT, "method not allowed\n".into());
+    }
+    match path {
+        "/healthz" if admin.online() => (200, ADMIN_TEXT, "ok\n".into()),
+        "/healthz" => (503, ADMIN_TEXT, "endpoint offline\n".into()),
+        "/readyz" => {
+            let (status, body) = admin.readiness();
+            (status, ADMIN_TEXT, body)
+        }
+        "/status" => (200, "application/json", admin.status().to_string()),
+        _ => (200, "text/plain; version=0.0.4; charset=utf-8", render_metrics(&admin.ctx.router, &admin.ctx.metrics, admin.inflight())),
+    }
+}
+
+/// Whole seconds left, rounded up so a cooldown never shows as 0 while it is still running.
+fn secs_ceil(d: Duration) -> u64 {
+    d.as_secs() + u64::from(d.subsec_nanos() > 0)
+}
+
+impl Admin {
+    /// Whether clients can reach the gateway: the endpoint is open and connected to at least
+    /// one home relay (what `Endpoint::online` waits for at startup).
+    fn online(&self) -> bool {
+        !self.endpoint.is_closed() && self.endpoint.home_relay_status().get().iter().any(|r| r.is_connected())
+    }
+
+    fn inflight(&self) -> usize {
+        self.ctx.max_requests - self.ctx.requests.available_permits()
+    }
+
+    /// Ready when online and every route (and the default backend) has an upstream outside
+    /// its cooldown; otherwise lists what is missing.
+    fn readiness(&self) -> (u16, String) {
+        let mut problems = String::new();
+        if !self.online() {
+            problems.push_str("endpoint offline\n");
+        }
+        for (label, upstreams) in self.ctx.router.all() {
+            let health = upstreams.health();
+            if health.iter().any(Option::is_none) {
+                continue;
+            }
+            let list: Vec<String> = upstreams
+                .urls
+                .iter()
+                .zip(&health)
+                .map(|(url, left)| format!("{url} (cooldown {}s)", left.map_or(0, secs_ceil)))
+                .collect();
+            let _ = writeln!(problems, "route {label}: no healthy upstream: {}", list.join(", "));
+        }
+        if problems.is_empty() { (200, "ready\n".into()) } else { (503, problems) }
+    }
+
+    fn status(&self) -> serde_json::Value {
+        use serde_json::json;
+        let relays: Vec<_> = self
+            .endpoint
+            .home_relay_status()
+            .get()
+            .iter()
+            .map(|r| json!({ "url": r.url().to_string(), "connected": r.is_connected(), "last_error": r.last_error().map(|e| e.to_string()) }))
+            .collect();
+        let routes: Vec<_> = self
+            .ctx
+            .router
+            .all()
+            .map(|(label, upstreams)| {
+                let list: Vec<_> = upstreams
+                    .urls
+                    .iter()
+                    .zip(upstreams.health())
+                    .map(|(url, left)| match left {
+                        None => json!({ "url": url, "healthy": true }),
+                        Some(left) => json!({ "url": url, "healthy": false, "cooldown_remaining_secs": secs_ceil(left) }),
+                    })
+                    .collect();
+                json!({ "route": label, "upstreams": list })
+            })
+            .collect();
+        json!({
+            "endpoint_id": self.endpoint.id().to_string(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_secs": self.started.elapsed().as_secs(),
+            "online": self.online(),
+            "relay_url": self.relay_url.as_ref().map(|u| u.to_string()),
+            "home_relays": relays,
+            "connections": self.ctx.metrics.connections.load(Ordering::Relaxed),
+            "inflight_requests": self.inflight(),
+            "max_requests": self.ctx.max_requests,
+            "routes": routes,
+        })
+    }
 }
 
 /// Loads the endpoint's secret key, or creates it on the very first run.
@@ -1284,6 +1797,78 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(60)).await;
         };
         assert_eq!(upstream_deadline(slow, limit, &upload).await, Some(()));
+    }
+
+    #[test]
+    fn admin_listener_is_loopback_only_unless_allowed() {
+        for ok in ["127.0.0.1:9180", "127.8.9.10:1", "[::1]:9180", "[::ffff:127.0.0.1]:9180"] {
+            assert!(check_admin_addr(ok.parse().unwrap(), false).is_ok(), "{ok}");
+        }
+        for public in ["0.0.0.0:9180", "[::]:9180", "192.168.1.5:9180", "[2001:db8::1]:9180", "[::ffff:10.0.0.1]:9180"] {
+            let addr: SocketAddr = public.parse().unwrap();
+            assert!(check_admin_addr(addr, false).is_err(), "{public}");
+            assert!(check_admin_addr(addr, true).is_ok(), "{public}");
+        }
+    }
+
+    #[test]
+    fn prometheus_labels_are_escaped() {
+        assert_eq!(prom_label(r#"a"b\c"#), r#"a\"b\\c"#);
+        assert_eq!(prom_label("x\ny"), r"x\ny");
+        assert_eq!(prom_label("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn metrics_render_in_text_format() {
+        let router = Router::parse(
+            &[r#"/q"uote=http://127.0.0.1:1"#.into()],
+            Some("http://127.0.0.1:1,http://127.0.0.1:2"),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let metrics = Metrics::default();
+        let default = router.default.as_ref().unwrap();
+        default.mark_failed(0, &"refused");
+        let mut out = Outcome::new(&metrics);
+        out.stats = Some(&default.stats);
+        out.head(200);
+        out.head(500); // only the first head counts
+        Outcome::new(&metrics).head(404);
+        default.stats.ws_result(WsResult::Upgraded);
+        metrics.reject(Reject::PathNotAllowed);
+        metrics.observe(Duration::from_millis(30));
+        metrics.observe(Duration::from_secs(60));
+
+        let text = render_metrics(&router, &metrics, 3);
+        for line in [
+            r#"iroh_gateway_requests_total{route="default",status_class="2xx"} 1"#,
+            r#"iroh_gateway_requests_total{route="default",status_class="5xx"} 0"#,
+            r#"iroh_gateway_requests_total{route="unrouted",status_class="4xx"} 1"#,
+            r#"iroh_gateway_requests_total{route="/q\"uote",status_class="2xx"} 0"#,
+            r#"iroh_gateway_websocket_upgrades_total{route="default",result="upgraded"} 1"#,
+            r#"iroh_gateway_upstream_failures_total{route="default",upstream="http://127.0.0.1:1"} 1"#,
+            r#"iroh_gateway_upstream_healthy{route="default",upstream="http://127.0.0.1:1"} 0"#,
+            r#"iroh_gateway_upstream_healthy{route="default",upstream="http://127.0.0.1:2"} 1"#,
+            r#"iroh_gateway_rejected_total{reason="path_not_allowed"} 1"#,
+            "iroh_gateway_connections 0",
+            "iroh_gateway_inflight_requests 3",
+            // The two recorded heads took next to no time.
+            r#"iroh_gateway_request_duration_seconds_bucket{le="0.01"} 2"#,
+            r#"iroh_gateway_request_duration_seconds_bucket{le="0.05"} 3"#,
+            r#"iroh_gateway_request_duration_seconds_bucket{le="10"} 3"#,
+            r#"iroh_gateway_request_duration_seconds_bucket{le="+Inf"} 4"#,
+            "iroh_gateway_request_duration_seconds_count 4",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line:?} in\n{text}");
+        }
+        // Every sample line is `name{labels} value` or `name value`, and every name has a TYPE.
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let (series, value) = line.rsplit_once(' ').unwrap();
+            assert!(value.parse::<f64>().is_ok(), "{line}");
+            let name = series.split('{').next().unwrap();
+            let base = name.trim_end_matches("_bucket").trim_end_matches("_sum").trim_end_matches("_count");
+            assert!(text.contains(&format!("# TYPE {base} ")), "{line}");
+        }
     }
 
     #[test]

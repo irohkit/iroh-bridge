@@ -1,0 +1,756 @@
+{
+  "info": {
+    "name": "iroh-bridge demo",
+    "description": "Calls an HTTP backend behind NAT through iroh. Postman can't speak iroh, so run iroh-proxy and point baseUrl at it:\n\n  npx -y -p iroh-fetch iroh-proxy <gateway endpoint id> --port 8787\n\nThen run this collection (Postman, or `npx newman run`). The requests and tests match examples/backend/server.mjs.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8787"
+    }
+  ],
+  "item": [
+    {
+      "name": "GET with query",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200 from backend A\", () => { pm.response.to.have.status(200); pm.expect(pm.response.json().backend).to.eql(\"A\"); });",
+              "pm.test(\"path and query reach the backend\", () => pm.expect(pm.response.json().url).to.eql(\"/hello?x=1\"));",
+              "pm.test(\"gateway adds the client's verified endpoint id\", () => pm.expect(pm.response.json().headers[\"x-iroh-remote-id\"]).to.match(/^[0-9a-f]{64}$/));",
+              "pm.test(\"response names the gateway that answered\", () => pm.expect(pm.response.headers.get(\"x-iroh-gateway-id\")).to.match(/^[0-9a-f]{64}$/));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/hello?x=1",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "hello"
+          ],
+          "query": [
+            {
+              "key": "x",
+              "value": "1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "POST JSON",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const b = pm.response.json();",
+              "pm.test(\"method, body and content-type arrive\", () => { pm.expect(b.method).to.eql(\"POST\"); pm.expect(JSON.parse(b.body)).to.eql({ name: \"rover\", n: 1 }); pm.expect(b.headers[\"content-type\"]).to.include(\"application/json\"); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/items",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "items"
+          ],
+          "query": []
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"name\":\"rover\",\"n\":1}"
+        }
+      }
+    },
+    {
+      "name": "PUT",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"PUT arrives with its body\", () => { pm.expect(pm.response.json().method).to.eql(\"PUT\"); pm.expect(pm.response.json().body).to.eql(\"updated\"); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "text/plain"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/items/1",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "items",
+            "1"
+          ],
+          "query": []
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "updated"
+        }
+      }
+    },
+    {
+      "name": "DELETE",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"DELETE arrives\", () => pm.expect(pm.response.json().method).to.eql(\"DELETE\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/items/1",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "items",
+            "1"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Custom headers pass through",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"custom header reaches the backend\", () => pm.expect(pm.response.json().headers[\"x-custom\"]).to.eql(\"hello postman\"));",
+              "pm.test(\"a spoofed X-Iroh-Remote-Id is replaced\", () => pm.expect(pm.response.json().headers[\"x-iroh-remote-id\"]).to.not.eql(\"ffff\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Custom",
+            "value": "hello postman"
+          },
+          {
+            "key": "X-Iroh-Remote-Id",
+            "value": "ffff"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/hello",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "hello"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Redirect 302 is followed",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"lands on the redirect target\", () => { pm.response.to.have.status(200); pm.expect(pm.response.json().url).to.eql(\"/hello?from=redirect\"); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/redirect",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "redirect"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Redirect 303 turns POST into GET",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"followed as GET\", () => { pm.expect(pm.response.json().method).to.eql(\"GET\"); pm.expect(pm.response.json().url).to.eql(\"/hello?from=303\"); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/redirect-303",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "redirect-303"
+          ],
+          "query": []
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "x"
+        }
+      }
+    },
+    {
+      "name": "Cookie login",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"sets two cookies\", () => { pm.response.to.have.status(200); pm.expect(pm.response.headers.filter((h) => h.key.toLowerCase() === \"set-cookie\").length).to.eql(2); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/login",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "login"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Cookie is sent back",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"backend sees the session cookie\", () => pm.expect(pm.response.json().cookie).to.include(\"session=abc123\"));",
+              "pm.test(\"X-Forwarded-Proto is set\", () => pm.expect(pm.response.json().proto).to.be.a(\"string\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/whoami",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "whoami"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Cookie logout",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200\", () => pm.response.to.have.status(200));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/logout",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "logout"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Cookie cleared",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"session cookie is gone\", () => pm.expect(String(pm.response.json().cookie)).to.not.include(\"session=abc123\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/whoami",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "whoami"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "JWT login with wrong password",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"401 with WWW-Authenticate\", () => { pm.response.to.have.status(401); pm.expect(pm.response.headers.get(\"www-authenticate\")).to.match(/Bearer/i); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/auth/login",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "auth",
+            "login"
+          ],
+          "query": []
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"username\":\"demo\",\"password\":\"wrong\"}"
+        }
+      }
+    },
+    {
+      "name": "JWT login",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"returns a token\", () => { pm.response.to.have.status(200); pm.expect(pm.response.json().token.split(\".\").length).to.eql(3); });",
+              "pm.collectionVariables.set(\"token\", pm.response.json().token);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/auth/login",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "auth",
+            "login"
+          ],
+          "query": []
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"username\":\"demo\",\"password\":\"demo\"}"
+        }
+      }
+    },
+    {
+      "name": "JWT protected route",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Bearer token is accepted\", () => { pm.response.to.have.status(200); pm.expect(JSON.stringify(pm.response.json())).to.include(\"Demo User\"); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/auth/me",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "auth",
+            "me"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "JWT protected route without token",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"401\", () => pm.response.to.have.status(401));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/auth/me",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "auth",
+            "me"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Upload body is streamed intact",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const sent = pm.collectionVariables.get(\"uploadBody\");",
+              "pm.test(\"byte count matches\", () => pm.expect(pm.response.json().bytes).to.eql(sent.length));",
+              "pm.test(\"sha256 matches\", () => pm.expect(pm.response.json().sha256).to.eql(CryptoJS.SHA256(sent).toString()));"
+            ]
+          }
+        },
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "let s = \"\"; for (let i = 0; i < 20000; i++) s += String.fromCharCode(97 + (i % 26));",
+              "pm.collectionVariables.set(\"uploadBody\", s);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/octet-stream"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/upload",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "upload"
+          ],
+          "query": []
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{{uploadBody}}"
+        }
+      }
+    },
+    {
+      "name": "Streamed response",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"all chunks arrive\", () => pm.expect(pm.response.text().trim().split(\"\\n\").length).to.eql(5));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/stream",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "stream"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Server-sent events",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"event stream\", () => { pm.expect(pm.response.headers.get(\"content-type\")).to.include(\"text/event-stream\"); pm.expect(pm.response.text()).to.include(\"data:\"); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/sse-once",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "sse-once"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "ETag",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"has an ETag\", () => pm.expect(pm.response.headers.get(\"etag\")).to.match(/^\"/));",
+              "pm.collectionVariables.set(\"etag\", pm.response.headers.get(\"etag\"));",
+              "pm.collectionVariables.set(\"cacheId\", pm.request.url.query.get(\"id\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/cache/resource?id=postman-{{$timestamp}}&etag=1",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "cache",
+            "resource"
+          ],
+          "query": [
+            {
+              "key": "id",
+              "value": "postman-{{$timestamp}}"
+            },
+            {
+              "key": "etag",
+              "value": "1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Conditional GET gives 304",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"304 Not Modified\", () => pm.response.to.have.status(304));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "If-None-Match",
+            "value": "{{etag}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/cache/resource?id={{cacheId}}&etag=1",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "cache",
+            "resource"
+          ],
+          "query": [
+            {
+              "key": "id",
+              "value": "{{cacheId}}"
+            },
+            {
+              "key": "etag",
+              "value": "1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Image",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"SVG with its content type\", () => { pm.response.to.have.status(200); pm.expect(pm.response.headers.get(\"content-type\")).to.include(\"image/svg+xml\"); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/image.svg",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "image.svg"
+          ],
+          "query": []
+        }
+      }
+    },
+    {
+      "name": "Download",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"attachment\", () => { pm.response.to.have.status(200); pm.expect(pm.response.headers.get(\"content-disposition\")).to.include(\"attachment\"); });"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/download",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "download"
+          ],
+          "query": []
+        }
+      }
+    }
+  ]
+}

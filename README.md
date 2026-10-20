@@ -45,6 +45,7 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
   - [What your backend sees](#what-your-backend-sees)
   - [Monitoring](#monitoring)
 - [Local port: `iroh-proxy`](#local-port-iroh-proxy)
+  - [Postman, Insomnia, curl](#postman-insomnia-curl)
 - [Run your own relay](#run-your-own-relay)
 - [Tested](#tested)
 - [Production notes](#production-notes)
@@ -671,6 +672,24 @@ HTTP (streaming both ways), redirects and cookies are passed through untouched, 
 (`ws://127.0.0.1:8080/ws`). It listens on `127.0.0.1` only by default, and to stop other websites from using it through
 your browser (DNS rebinding, cross-site requests) it only accepts `Host: localhost`/IP and same-origin `Origin` headers.
 Add exceptions with `--allow-host` and `--allow-origin`.
+
+### Postman, Insomnia, curl
+
+These tools speak plain HTTP, so point them at `iroh-proxy`. With a token-protected relay add
+`--relay-url https://relay.example.com --relay-token ...` (or `IROH_RELAY_TOKEN`).
+
+```bash
+npx -y -p iroh-fetch iroh-proxy <endpoint id> --port 8787
+```
+
+Then use `http://127.0.0.1:8787` as the base URL. Cookies, redirects, `Authorization: Bearer` headers, uploads,
+streamed responses, SSE, conditional requests (`If-None-Match` / 304) and WebSockets behave as against the backend
+directly. [`examples/postman/`](examples/postman/iroh-bridge-demo.postman_collection.json) is a collection with 22
+requests and 28 tests against the demo backend; import it into Postman, or run it from the command line:
+
+```bash
+npx -y newman run examples/postman/iroh-bridge-demo.postman_collection.json
+```
 
 ## Run your own relay
 

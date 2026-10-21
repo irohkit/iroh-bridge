@@ -845,8 +845,9 @@ release. When there is one, it updates the workspace, builds the gateway, the WA
 iroh-relay, and runs the whole iroh-fetch suite end to end with [`scripts/e2e-local.sh`](scripts/e2e-local.sh): a
 token-protected relay, both demo backends and three gateways on one runner, with both client engines.
 
-- Everything passes: it pushes `bot/iroh-<version>` and opens a pull request with the results.
-- Something fails: it pushes the branch anyway and opens an issue naming the step that broke, with log excerpts.
+- Everything passes: it merges the update into `main` by itself. That doesn't publish anything: the next tag releases it.
+- Something fails: it pushes `bot/iroh-<version>` and opens an issue naming the step that broke, with log excerpts. A
+  later run that passes closes that issue.
 
 Run it by hand from the Actions tab ("Run workflow", optionally with a version). `scripts/e2e-local.sh` also works
 locally once the gateway, WASM and native addon are built and `iroh-relay` is installed.

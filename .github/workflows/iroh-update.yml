@@ -4,9 +4,9 @@ name: iroh-update
 # workspace to it, builds everything (gateway, WASM web client, native Node addon, iroh-relay)
 # and runs the whole iroh-fetch suite end to end (scripts/e2e-local.sh: local token-protected
 # relay, two backends, three gateways, both client engines).
-#   - all green: pushes branch bot/iroh-<version> and opens a pull request with the results;
-#   - anything red: pushes the branch too and opens an issue saying which step broke, with log
-#     excerpts, so the fix can start from it.
+#   - all green: merges the update into main by itself (rebased onto the latest main);
+#   - anything red: pushes branch bot/iroh-<version> and opens an issue saying which step broke,
+#     with log excerpts, so the fix can start from it. If the merge itself fails, also an issue.
 # Runs daily; "Run workflow" can test a given version (or re-test one already handled).
 
 on:
@@ -25,7 +25,6 @@ on:
 permissions:
   contents: write
   issues: write
-  pull-requests: write
 
 concurrency:
   group: iroh-update
@@ -226,15 +225,20 @@ jobs:
 
           compare="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$BRANCH?expand=1"
           if [ "$ok" = true ]; then
-            title="Update iroh to $TARGET"
-            if gh pr view "$BRANCH" --json url -q .url >/dev/null 2>&1; then
-              gh pr comment "$BRANCH" --body-file "$body"
-            elif ! gh pr create --head "$BRANCH" --title "$title" --body-file "$body"; then
-              # Repositories that don't let Actions open pull requests get an issue with a one-click link.
-              echo; echo "All checks passed. [Open the pull request]($compare) (Actions may not open pull requests in this repository)." >> "$body"
-              gh issue create --title "$title: tests pass, ready to merge" --body-file "$body"
+            # Everything passed: merge it into main straight away (rebased onto the latest main).
+            git fetch -q origin main
+            if git rebase -q origin/main && git push origin "HEAD:main"; then
+              git push -q origin --delete "$BRANCH" || true
+              echo "## ✅ iroh $TARGET passes and is merged into main ($(git rev-parse --short HEAD))" >> "$GITHUB_STEP_SUMMARY"
+              # An earlier failure report for this version is now resolved.
+              old=$(gh issue list --state open --search "\"iroh $TARGET breaks iroh-bridge\" in:title" --json number -q '.[0].number')
+              [ -z "$old" ] || gh issue close "$old" --comment "Fixed: iroh $TARGET now passes and is merged ($(git rev-parse --short HEAD), $RUN_URL)."
+            else
+              git rebase --abort 2>/dev/null || true
+              { echo; echo "All tests passed, but merging into main failed (it changed in a conflicting way, or pushing was refused). [Compare and merge by hand]($compare)."; } >> "$body"
+              gh issue create --title "Update iroh to $TARGET: tests pass, merge needs a hand" --body-file "$body"
+              echo "## ⚠️ iroh $TARGET passes but could not be merged: see the issue" >> "$GITHUB_STEP_SUMMARY"
             fi
-            echo "## ✅ iroh $TARGET passes" >> "$GITHUB_STEP_SUMMARY"
           else
             title="iroh $TARGET breaks iroh-bridge"
             existing=$(gh issue list --state open --search "\"$title\" in:title" --json number -q '.[0].number')

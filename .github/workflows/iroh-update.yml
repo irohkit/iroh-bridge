@@ -161,7 +161,7 @@ jobs:
           E2E_LOG_DIR="$RUNNER_TEMP/e2e" RELAY_BIN="$RUNNER_TEMP/relay/bin/iroh-relay" ./scripts/e2e-local.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log"
 
       - name: Report
-        if: always()
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

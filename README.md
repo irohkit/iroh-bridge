@@ -845,7 +845,8 @@ release. When there is one, it updates the workspace, builds the gateway, the WA
 iroh-relay, and runs the whole iroh-fetch suite end to end with [`scripts/e2e-local.sh`](scripts/e2e-local.sh): a
 token-protected relay, both demo backends and three gateways on one runner, with both client engines.
 
-- Everything passes: it merges the update into `main` by itself. That doesn't publish anything: the next tag releases it.
+- Everything passes: it merges the update into `main`, bumps the patch version of iroh-fetch and iroh-gateway, tags
+  it and starts the release workflows (npm, gateway binaries, Docker). If one of those fails, it opens an issue.
 - Something fails: it pushes `bot/iroh-<version>` and opens an issue naming the step that broke, with log excerpts. A
   later run that passes closes that issue.
 

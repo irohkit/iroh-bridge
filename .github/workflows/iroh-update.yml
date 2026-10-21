@@ -4,7 +4,9 @@ name: iroh-update
 # workspace to it, builds everything (gateway, WASM web client, native Node addon, iroh-relay)
 # and runs the whole iroh-fetch suite end to end (scripts/e2e-local.sh: local token-protected
 # relay, two backends, three gateways, both client engines).
-#   - all green: merges the update into main by itself (rebased onto the latest main);
+#   - all green: merges the update into main by itself (rebased onto the latest main), bumps the
+#     patch version of iroh-fetch and iroh-gateway, tags it and starts the release workflows
+#     (npm, gateway binaries, Docker); a last job opens an issue if any of those fails;
 #   - anything red: pushes branch bot/iroh-<version> and opens an issue saying which step broke,
 #     with log excerpts, so the fix can start from it. If the merge itself fails, also an issue.
 # Runs daily; "Run workflow" can test a given version (or re-test one already handled).
@@ -21,10 +23,15 @@ on:
         description: "Test even if this version is current or already has a bot branch"
         type: boolean
         default: false
+      release:
+        description: "After merging, tag a patch release and publish it"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
   issues: write
+  actions: write # to start the release workflows on the new tag
 
 concurrency:
   group: iroh-update
@@ -79,6 +86,8 @@ jobs:
     if: needs.check.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      tag: ${{ steps.report.outputs.tag }}
     env:
       CURRENT: ${{ needs.check.outputs.current }}
       TARGET: ${{ needs.check.outputs.target }}
@@ -161,8 +170,10 @@ jobs:
           E2E_LOG_DIR="$RUNNER_TEMP/e2e" RELAY_BIN="$RUNNER_TEMP/relay/bin/iroh-relay" ./scripts/e2e-local.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log"
 
       - name: Report
+        id: report
         if: ${{ !cancelled() }}
         env:
+          RELEASE: ${{ github.event_name == 'schedule' || inputs.release }}
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           OUT_update: ${{ steps.update.outcome }}
@@ -222,14 +233,44 @@ jobs:
           if [ "$ok" = true ]; then verdict=passed; else verdict=FAILED; fi
           git commit -q -m "Update iroh to $TARGET (iroh-relay $RELAY_TARGET)" -m "Automated by .github/workflows/iroh-update.yml. Tests $verdict: $RUN_URL" || true
           git push -f origin "$BRANCH" || echo "::warning::could not push $BRANCH"
+          # Drop anything else the builds touched, so the rebase below starts from a clean tree.
+          git reset -q --hard HEAD
 
           compare="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$BRANCH?expand=1"
           if [ "$ok" = true ]; then
             # Everything passed: merge it into main straight away (rebased onto the latest main).
             git fetch -q origin main
-            if git rebase -q origin/main && git push origin "HEAD:main"; then
+            tag=""
+            if git rebase -q origin/main; then
+              if [ "$RELEASE" = true ]; then
+                # Patch release of both packages; publish-npm checks that the tag matches them.
+                current_version=$(node -p "require('./packages/iroh-fetch/package.json').version")
+                next=$(echo "$current_version" | awk -F. '{ printf "%d.%d.%d", $1, $2, $3 + 1 }')
+                sed -i -E "s/\"version\": \"$current_version\"/\"version\": \"$next\"/" packages/iroh-fetch/package.json
+                sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"$next\"/" crates/gateway/Cargo.toml
+                cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace
+                git add packages/iroh-fetch/package.json crates/gateway/Cargo.toml Cargo.lock
+                git commit -q -m "Release v$next: iroh $TARGET" -m "Automated by .github/workflows/iroh-update.yml after all tests passed: $RUN_URL"
+                tag="v$next"
+              fi
+            fi
+            if [ -n "$(git status --porcelain --untracked-files=no)" ] || ! git push origin "HEAD:main"; then
+              merged=false
+            else
+              merged=true
+            fi
+            if [ "$merged" = true ]; then
               git push -q origin --delete "$BRANCH" || true
               echo "## ✅ iroh $TARGET passes and is merged into main ($(git rev-parse --short HEAD))" >> "$GITHUB_STEP_SUMMARY"
+              if [ -n "$tag" ]; then
+                git tag "$tag" && git push origin "$tag"
+                # Tags pushed with this workflow's token start no workflows, so start them here.
+                gh workflow run publish-npm.yml --ref "$tag"
+                gh workflow run release-gateway.yml --ref "$tag" -f tag="$tag"
+                gh workflow run docker.yml --ref "$tag"
+                echo "tag=$tag" >> "$GITHUB_OUTPUT"
+                echo "Released as **$tag** (npm, gateway binaries, Docker image are building)." >> "$GITHUB_STEP_SUMMARY"
+              fi
               # An earlier failure report for this version is now resolved.
               old=$(gh issue list --state open --search "\"iroh $TARGET breaks iroh-bridge\" in:title" --json number -q '.[0].number')
               [ -z "$old" ] || gh issue close "$old" --comment "Fixed: iroh $TARGET now passes and is merged ($(git rev-parse --short HEAD), $RUN_URL)."
@@ -262,3 +303,36 @@ jobs:
             ${{ runner.temp }}/e2e
           if-no-files-found: ignore
           retention-days: 14
+
+  # Waits for the release workflows the bot started and opens an issue if one of them fails.
+  release-check:
+    needs: [check, test]
+    if: needs.test.outputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.test.outputs.tag }}
+          TARGET: ${{ needs.check.outputs.target }}
+        run: |
+          failed=""
+          for wf in publish-npm.yml release-gateway.yml docker.yml; do
+            id=""
+            for _ in $(seq 30); do
+              id=$(gh run list --workflow "$wf" --branch "$TAG" --limit 1 --json databaseId -q '.[0].databaseId')
+              [ -n "$id" ] && break
+              sleep 10
+            done
+            if [ -z "$id" ]; then failed+=" $wf (never started)"; continue; fi
+            gh run watch "$id" --interval 60 > /dev/null 2>&1 || true
+            conclusion=$(gh run view "$id" --json conclusion -q .conclusion)
+            echo "$wf: $conclusion ($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$id)" | tee -a "$GITHUB_STEP_SUMMARY"
+            [ "$conclusion" = success ] || failed+=" [$wf]($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$id) ($conclusion)"
+          done
+          if [ -n "$failed" ]; then
+            gh issue create --title "Release $TAG (iroh $TARGET) did not finish" \
+              --body "The update bot merged iroh $TARGET and tagged $TAG, but these release workflows didn't succeed:$failed. Re-run the failed jobs (runner hiccups such as a cancelled macOS job are common), or fix and re-tag."
+            exit 1
+          fi

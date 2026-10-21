@@ -83,12 +83,23 @@ of them through two HA gateways, using only the standard `fetch` / `EventSource`
 
 ## Quick start
 
-**1. Next to your backend**, start a gateway (it prints the endpoint id, which is your backend's address):
+**1. Next to your backend**, install and start a gateway. It prints the endpoint id, which is your backend's address:
 
 ```bash
-BACKEND_URL=http://127.0.0.1:8080 ./iroh-gateway
+curl -fsSL https://raw.githubusercontent.com/irohkit/iroh-bridge/main/scripts/install-gateway.sh | sh   # Linux, macOS
+BACKEND_URL=http://127.0.0.1:8080 iroh-gateway
 # IROH_ENDPOINT_ID=acc0c8d6bc20700875b5fe1da1a3379f77f28dd16f8a66e3368856473ecc7a53
 ```
+
+Windows: `irm https://raw.githubusercontent.com/irohkit/iroh-bridge/main/scripts/install-gateway.ps1 | iex`. Docker:
+
+```bash
+docker run -d --name iroh-gateway -e BACKEND_URL=http://host.docker.internal:8080 \
+  --add-host=host.docker.internal:host-gateway -v iroh-gateway:/data ghcr.io/irohkit/iroh-gateway
+docker logs iroh-gateway   # shows IROH_ENDPOINT_ID=...
+```
+
+To keep it running as a service, see [Install](#install).
 
 **2. In the frontend**, map an origin of your choice to that id and keep writing normal code:
 

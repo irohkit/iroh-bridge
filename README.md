@@ -837,6 +837,20 @@ CI then publishes to npm (trusted publishing, no token in the repo): first the s
 packages built by `native-prebuilds.yml`, then `iroh-fetch` pinning them as optional dependencies. It also attaches gateway binaries to the GitHub release
 and pushes the Docker image.
 
+
+### Keeping up with iroh
+
+[`iroh-update.yml`](.github/workflows/iroh-update.yml) checks crates.io every day for a new iroh / iroh-relay
+release. When there is one, it updates the workspace, builds the gateway, the WASM web client, the native Node addon and
+iroh-relay, and runs the whole iroh-fetch suite end to end with [`scripts/e2e-local.sh`](scripts/e2e-local.sh): a
+token-protected relay, both demo backends and three gateways on one runner, with both client engines.
+
+- Everything passes: it pushes `bot/iroh-<version>` and opens a pull request with the results.
+- Something fails: it pushes the branch anyway and opens an issue naming the step that broke, with log excerpts.
+
+Run it by hand from the Actions tab ("Run workflow", optionally with a version). `scripts/e2e-local.sh` also works
+locally once the gateway, WASM and native addon are built and `iroh-relay` is installed.
+
 ## License
 
 MIT

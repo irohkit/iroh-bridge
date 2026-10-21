@@ -1,0 +1,260 @@
+name: iroh-update
+
+# Watches crates.io for new iroh / iroh-relay releases. When one appears it updates the
+# workspace to it, builds everything (gateway, WASM web client, native Node addon, iroh-relay)
+# and runs the whole iroh-fetch suite end to end (scripts/e2e-local.sh: local token-protected
+# relay, two backends, three gateways, both client engines).
+#   - all green: pushes branch bot/iroh-<version> and opens a pull request with the results;
+#   - anything red: pushes the branch too and opens an issue saying which step broke, with log
+#     excerpts, so the fix can start from it.
+# Runs daily; "Run workflow" can test a given version (or re-test one already handled).
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "iroh version to test (default: latest stable on crates.io)"
+        required: false
+      force:
+        description: "Test even if this version is current or already has a bot branch"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: iroh-update
+  cancel-in-progress: false
+
+env:
+  CRATES_UA: "iroh-bridge update bot (https://github.com/irohkit/iroh-bridge)"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.versions.outputs.run }}
+      current: ${{ steps.versions.outputs.current }}
+      target: ${{ steps.versions.outputs.target }}
+      relay_current: ${{ steps.versions.outputs.relay_current }}
+      relay_target: ${{ steps.versions.outputs.relay_target }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          locked() { grep -A1 "^name = \"$1\"$" Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p' | head -1; }
+          latest() { curl -sf -H "User-Agent: $CRATES_UA" "https://crates.io/api/v1/crates/$1" | jq -r .crate.max_stable_version; }
+          current=$(locked iroh)
+          target=${INPUT_VERSION:-$(latest iroh)}
+          relay_current=$(sed -n 's/.*iroh-relay --version \([0-9.]*\).*/\1/p' deploy/relay/install.sh | head -1)
+          relay_target=$(latest iroh-relay)
+          echo "iroh: $current -> $target; iroh-relay: $relay_current -> $relay_target"
+          run=false
+          newest=$(printf '%s\n%s\n' "$current" "$target" | sort -V | tail -1)
+          if [ "$FORCE" = true ]; then
+            run=true
+          elif [ "$target" != "$current" ] && [ "$newest" = "$target" ]; then
+            if git ls-remote --exit-code --heads origin "bot/iroh-$target" >/dev/null; then
+              echo "bot/iroh-$target already exists; nothing to do (run with force to test again)"
+            else
+              run=true
+            fi
+          fi
+          {
+            echo "run=$run"; echo "current=$current"; echo "target=$target"
+            echo "relay_current=$relay_current"; echo "relay_target=$relay_target"
+          } >> "$GITHUB_OUTPUT"
+          echo "### iroh $current → $target (iroh-relay $relay_current → $relay_target): test=$run" >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    needs: check
+    if: needs.check.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CURRENT: ${{ needs.check.outputs.current }}
+      TARGET: ${{ needs.check.outputs.target }}
+      RELAY_CURRENT: ${{ needs.check.outputs.relay_current }}
+      RELAY_TARGET: ${{ needs.check.outputs.relay_target }}
+      BRANCH: bot/iroh-${{ needs.check.outputs.target }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Update iroh to ${{ env.TARGET }}
+        id: update
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          # Require the new version, so nothing resolves back to an older one.
+          sed -i -E "s/^iroh = \{ version = \"[^\"]+\"/iroh = { version = \"$TARGET\"/" Cargo.toml
+          cargo update -p iroh 2>&1 | tee "$RUNNER_TEMP/update.log"
+          # Pin the relay version the deploy files install to the newest iroh-relay.
+          sed -i -E "s/iroh-relay --version [0-9.]+/iroh-relay --version $RELAY_TARGET/g" deploy/relay/install.sh
+          sed -i -E "s#n0computer/iroh-relay:v[0-9.]+#n0computer/iroh-relay:v$RELAY_TARGET#" deploy/relay/docker-compose.yml
+          git diff --stat
+
+      - name: Build iroh-gateway
+        id: gateway
+        if: steps.update.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo build --release -p iroh-gateway 2>&1 | tee "$RUNNER_TEMP/gateway.log"
+
+      - name: Rust tests
+        id: rust_tests
+        if: steps.gateway.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --release -p iroh-gateway -p proto -p client-core 2>&1 | tee "$RUNNER_TEMP/rust-tests.log"
+
+      - name: Build WASM web client
+        id: wasm
+        if: steps.update.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/version = "\(.*\)"/\1/p')
+          cargo install wasm-bindgen-cli --version "$version" --locked
+          curl -sL https://github.com/WebAssembly/binaryen/releases/download/version_125/binaryen-version_125-x86_64-linux.tar.gz | tar xz -C "$RUNNER_TEMP"
+          PATH="$RUNNER_TEMP/binaryen-version_125/bin:$PATH" ./scripts/build-wasm.sh 2>&1 | tee "$RUNNER_TEMP/wasm.log"
+
+      - name: Build native Node addon
+        id: native
+        if: steps.update.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./scripts/build-native.sh 2>&1 | tee "$RUNNER_TEMP/native.log"
+
+      - name: Install iroh-relay ${{ env.RELAY_TARGET }}
+        id: relay
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo install iroh-relay --version "$RELAY_TARGET" --features server --locked --root "$RUNNER_TEMP/relay" 2>&1 | tail -20 | tee "$RUNNER_TEMP/relay.log"
+
+      - name: End-to-end tests
+        id: e2e
+        if: steps.gateway.outcome == 'success' && steps.wasm.outcome == 'success' && steps.native.outcome == 'success' && steps.relay.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          (cd examples/backend && npm ci --no-audit --no-fund)
+          E2E_LOG_DIR="$RUNNER_TEMP/e2e" RELAY_BIN="$RUNNER_TEMP/relay/bin/iroh-relay" ./scripts/e2e-local.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OUT_update: ${{ steps.update.outcome }}
+          OUT_gateway: ${{ steps.gateway.outcome }}
+          OUT_rust_tests: ${{ steps.rust_tests.outcome }}
+          OUT_wasm: ${{ steps.wasm.outcome }}
+          OUT_native: ${{ steps.native.outcome }}
+          OUT_relay: ${{ steps.relay.outcome }}
+          OUT_e2e: ${{ steps.e2e.outcome }}
+        run: |
+          declare -A label=([update]="Update Cargo.toml / Cargo.lock" [gateway]="Build iroh-gateway" [rust_tests]="Rust tests"
+            [wasm]="Build WASM web client" [native]="Build native Node addon" [relay]="Install iroh-relay $RELAY_TARGET"
+            [e2e]="End-to-end tests (WASM + native)")
+          declare -A logfile=([update]=update.log [gateway]=gateway.log [rust_tests]=rust-tests.log [wasm]=wasm.log
+            [native]=native.log [relay]=relay.log [e2e]=e2e.log)
+          body="$RUNNER_TEMP/report.md"
+          fence='```'
+          ok=true
+          {
+            echo "iroh **$CURRENT → $TARGET** ([release notes](https://github.com/n0-computer/iroh/releases/tag/v$TARGET), [changes](https://github.com/n0-computer/iroh/compare/v$CURRENT...v$TARGET)); deploy files pin iroh-relay **$RELAY_CURRENT → $RELAY_TARGET**."
+            echo
+            echo "| Step | Result |"
+            echo "|---|---|"
+          } > "$body"
+          for s in update gateway rust_tests wasm native relay e2e; do
+            var="OUT_$s"
+            result=${!var}
+            [ -n "$result" ] || result=skipped
+            case "$result" in
+              success) icon="✅" ;;
+              skipped) icon="⏭️"; ok=false ;;
+              *) icon="❌"; ok=false ;;
+            esac
+            echo "| ${label[$s]} | $icon $result |" >> "$body"
+          done
+          if [ -f "$RUNNER_TEMP/e2e.log" ]; then
+            { echo; echo "End to end (local token relay with gateways A1 and B, A2 on n0's relays):"; echo "$fence"
+              grep -E '^==> iroh-fetch tests|^    (FAILED|ℹ|✖)' "$RUNNER_TEMP/e2e.log" || true
+              echo "$fence"; } >> "$body"
+          fi
+          for s in update gateway rust_tests wasm native relay e2e; do
+            var="OUT_$s"
+            [ "${!var}" = failure ] || continue
+            f="$RUNNER_TEMP/${logfile[$s]}"
+            { echo; echo "### ${label[$s]}"; echo; echo "$fence"
+              grep -E 'error(\[|:)|^✖|FAILED|panicked' "$f" 2>/dev/null | head -40 | cut -c1-300 || true
+              echo "…"
+              tail -30 "$f" 2>/dev/null | cut -c1-300 || true
+              echo "$fence"; } >> "$body"
+          done
+          { echo; echo "Branch \`$BRANCH\` · [workflow run]($RUN_URL) (full logs in the \`e2e-logs\` artifact)"; } >> "$body"
+
+          git config user.name "iroh-bridge-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add Cargo.toml Cargo.lock packages/iroh-fetch/wasm deploy/relay/install.sh deploy/relay/docker-compose.yml
+          if [ "$ok" = true ]; then verdict=passed; else verdict=FAILED; fi
+          git commit -q -m "Update iroh to $TARGET (iroh-relay $RELAY_TARGET)" -m "Automated by .github/workflows/iroh-update.yml. Tests $verdict: $RUN_URL" || true
+          git push -f origin "$BRANCH" || echo "::warning::could not push $BRANCH"
+
+          compare="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$BRANCH?expand=1"
+          if [ "$ok" = true ]; then
+            title="Update iroh to $TARGET"
+            if gh pr view "$BRANCH" --json url -q .url >/dev/null 2>&1; then
+              gh pr comment "$BRANCH" --body-file "$body"
+            elif ! gh pr create --head "$BRANCH" --title "$title" --body-file "$body"; then
+              # Repositories that don't let Actions open pull requests get an issue with a one-click link.
+              echo; echo "All checks passed. [Open the pull request]($compare) (Actions may not open pull requests in this repository)." >> "$body"
+              gh issue create --title "$title: tests pass, ready to merge" --body-file "$body"
+            fi
+            echo "## ✅ iroh $TARGET passes" >> "$GITHUB_STEP_SUMMARY"
+          else
+            title="iroh $TARGET breaks iroh-bridge"
+            existing=$(gh issue list --state open --search "\"$title\" in:title" --json number -q '.[0].number')
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body-file "$body"
+            else
+              { echo; echo "The branch has the version bump to start the fix from: [compare]($compare)."; } >> "$body"
+              gh issue create --title "$title" --body-file "$body"
+            fi
+            echo "## ❌ iroh $TARGET: see the issue" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/e2e
+          if-no-files-found: ignore
+          retention-days: 14

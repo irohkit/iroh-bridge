@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 200" width="880" height="200" role="img" aria-label="iroh-bridge">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5B4BF5"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(20 20) scale(0.3125)">
+    <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+    <rect x="241" y="214" width="30" height="190" rx="8" fill="#fff" opacity=".28"/>
+    <rect x="241" y="252" width="30" height="8" fill="#5B4BF5" opacity=".35"/>
+    <rect x="241" y="300" width="30" height="8" fill="#5B4BF5" opacity=".35"/>
+    <rect x="241" y="348" width="30" height="8" fill="#5B4BF5" opacity=".35"/>
+    <path d="M120 340 C 170 120, 342 120, 392 340" fill="none" stroke="#fff" stroke-width="30" stroke-linecap="round"/>
+    <circle cx="120" cy="340" r="46" fill="#fff"/>
+    <circle cx="392" cy="340" r="46" fill="#fff"/>
+    <circle cx="120" cy="340" r="18" fill="#5B4BF5"/>
+    <circle cx="392" cy="340" r="18" fill="#14B8A6"/>
+  </g>
+  <text x="212" y="104" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="68" font-weight="700" letter-spacing="-1.5" fill="#F8FAFC">iroh<tspan fill="#14B8A6">-</tspan>bridge</text>
+  <text x="214" y="150" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="25" fill="#94A3B8">fetch() and WebSocket to any backend behind NAT</text>
+</svg>

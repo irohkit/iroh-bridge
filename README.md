@@ -1,4 +1,9 @@
-# iroh-bridge
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/iroh-bridge-logo-dark.svg">
+    <img alt="iroh-bridge" src="assets/brand/iroh-bridge-logo-light.svg" width="440">
+  </picture>
+</h1>
 
 [![npm](https://img.shields.io/npm/v/iroh-fetch)](https://www.npmjs.com/package/iroh-fetch)
 [![ci](https://github.com/irohkit/iroh-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/irohkit/iroh-bridge/actions/workflows/ci.yml)
@@ -856,3 +861,6 @@ locally once the gateway, WASM and native addon are built and `iroh-relay` is in
 ## License
 
 MIT
+
+iroh-bridge is a community project built on [iroh](https://github.com/n0-computer/iroh). It is not affiliated with or
+endorsed by n0, the company behind iroh. The logo in [`assets/brand/`](assets/brand) is this project's own.

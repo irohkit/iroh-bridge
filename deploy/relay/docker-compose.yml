@@ -9,7 +9,7 @@
 # Point `networks` at the network your proxy container is on.
 services:
   iroh-relay:
-    image: n0computer/iroh-relay:v1.4.0
+    image: n0computer/iroh-relay:v1.4.1
     container_name: iroh-relay
     command: ["--config-path", "/iroh-relay.toml"]
     restart: unless-stopped

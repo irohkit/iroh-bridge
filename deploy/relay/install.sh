@@ -10,7 +10,7 @@
 #
 # Point the DNS name at this machine and open 80/tcp, 443/tcp and 7842/udp first. Without a
 # binary path it uses ~/.cargo/bin/iroh-relay or runs
-# `cargo install iroh-relay --version 1.4.0 --features server --locked`.
+# `cargo install iroh-relay --version 1.4.1 --features server --locked`.
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
 cd "$(dirname "$0")"
@@ -25,7 +25,7 @@ if [ -z "$BIN" ]; then
   owner_home=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)
   BIN="$owner_home/.cargo/bin/iroh-relay"
   if [ ! -x "$BIN" ]; then
-    sudo -u "${SUDO_USER:-root}" "$owner_home/.cargo/bin/cargo" install iroh-relay --version 1.4.0 --features server --locked
+    sudo -u "${SUDO_USER:-root}" "$owner_home/.cargo/bin/cargo" install iroh-relay --version 1.4.1 --features server --locked
   fi
 fi
 [ -x "$BIN" ] || { echo "no iroh-relay binary at $BIN" >&2; exit 1; }

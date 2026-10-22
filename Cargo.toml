@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/proto", "crates/client-core", "crates/gateway", "crates/web-client", "crates/node-client"]
 
 [workspace.dependencies]
-iroh = { version = "1.4.0", default-features = false, features = ["tls-ring"] }
+iroh = { version = "1.4.1", default-features = false, features = ["tls-ring"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
